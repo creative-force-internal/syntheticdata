@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     host: true,
     port: 3000,
+    allowedHosts: ['syntheticdata.creativeoperations.com'],
     proxy: {
       '/api': 'http://localhost:3001',
     },
