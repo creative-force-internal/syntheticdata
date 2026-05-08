@@ -14,7 +14,7 @@
       "essential": true,
       "portMappings": [
         {
-          "containerPort": 5173,
+          "containerPort": 3000,
           "protocol": "tcp"
         }
       ],
@@ -22,7 +22,7 @@
         "traefik.enable": "true",
         "traefik.http.routers.syntheticdata.rule": "Host(`syntheticdata.creativeoperations.com`)",
         "traefik.http.routers.syntheticdata.entrypoints": "web",
-        "traefik.http.services.syntheticdata.loadbalancer.server.port": "5173"
+        "traefik.http.services.syntheticdata.loadbalancer.server.port": "3000"
       },
       "logConfiguration": {
         "logDriver": "awslogs",
