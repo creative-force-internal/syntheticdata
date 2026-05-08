@@ -6,6 +6,7 @@
     "packages/frontend"
   ],
   "scripts": {
+    "dev": "concurrently \"npm --workspace packages/backend run dev\" \"npm --workspace packages/frontend run dev\"",
     "dev:backend": "npm --workspace packages/backend run dev",
     "dev:frontend": "npm --workspace packages/frontend run dev",
     "build": "npm --workspace packages/backend run build && npm --workspace packages/frontend run build"
