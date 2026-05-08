@@ -1,0 +1,223 @@
+name: Zero-Ops Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO: ${{ secrets.ECR_REPO }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  SERVICE_NAME: syntheticdata
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with Railpack
+        id: railpack
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm --privileged -d --name buildkitd moby/buildkit
+          curl -fsSL https://railpack.com/install.sh | bash
+          BUILDKIT_HOST=docker-container://buildkitd railpack build --name "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Fallback Docker Build
+        if: steps.railpack.outcome == 'failure'
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }} .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+
+      - name: Verify image pushed
+        run: |
+          aws ecr describe-images \
+            --repository-name $ECR_REPO \
+            --image-ids imageTag=${{ github.sha }} \
+            --output text > /dev/null
+
+      - name: Deploy to ECS
+        env:
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
+          ECS_SECURITY_GROUP_ID: ${{ secrets.ECS_SECURITY_GROUP_ID }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          cp ecs-task-def.json /tmp/task-def.json
+          sed -i "s|<ECR_IMAGE_URL>|$IMAGE|g" /tmp/task-def.json
+          sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g" /tmp/task-def.json
+          sed -i "s|<AWS_REGION>|$AWS_REGION|g" /tmp/task-def.json
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $SERVICE_NAME \
+            --query 'services[0].status' \
+            --output text || echo "MISSING")
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            aws ecs update-service \
+              --cluster $ECS_CLUSTER \
+              --service $SERVICE_NAME \
+              --task-definition $TASK_DEF_ARN \
+              --force-new-deployment
+          else
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name $SERVICE_NAME \
+              --task-definition $TASK_DEF_ARN \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET_IDS],securityGroups=[$ECS_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
+              --tags key=Environment,value=demo key=TTL,value=72h key=Owner,value=$GITHUB_ACTOR key=Project,value=$SERVICE_NAME
+          fi
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $SERVICE_NAME
+
+      - name: Create Cloudflare DNS CNAME record
+        if: env.CLOUDFLARE_TUNNEL_ID != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          HOSTNAME: syntheticdata.creativeoperations.com
+        run: |
+          TUNNEL_CNAME="$CLOUDFLARE_TUNNEL_ID.cfargotunnel.com"
+          EXISTS=$(curl -sS \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=CNAME&name=$HOSTNAME" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result | length')
+          if [ "$EXISTS" = "0" ]; then
+            curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"type":"CNAME","name":"'"$HOSTNAME"'","content":"'"$TUNNEL_CNAME"'","proxied":true}'
+            echo "DNS CNAME created: $HOSTNAME → $TUNNEL_CNAME"
+          else
+            echo "DNS record already exists: $HOSTNAME"
+          fi
+
+      - name: Register Cloudflare Tunnel hostname
+        if: env.CLOUDFLARE_TUNNEL_ID != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          HOSTNAME: syntheticdata.creativeoperations.com
+        run: |
+          CURRENT=$(curl -sS \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$CLOUDFLARE_TUNNEL_ID/configurations" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          INGRESS=$(echo "$CURRENT" | jq '.result.config.ingress | map(select(.service != "http_status:404"))')
+          EXISTS=$(echo "$INGRESS" | jq --arg h "$HOSTNAME" '[.[] | select(.hostname == $h)] | length')
+          if [ "$EXISTS" = "0" ]; then
+            NEW_INGRESS=$(echo "$INGRESS" | jq --arg h "$HOSTNAME" \
+              '. + [{"hostname": $h, "service": "http://localhost:80"}] + [{"service": "http_status:404"}]')
+            curl -sS -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$CLOUDFLARE_TUNNEL_ID/configurations" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"config\": {\"ingress\": $NEW_INGRESS}}"
+            echo "Registered: $HOSTNAME"
+          else
+            echo "Already registered: $HOSTNAME"
+          fi
+
+      - name: Add hostname to Cloudflare Access app
+        if: env.CLOUDFLARE_ACCESS_APP_ID != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCESS_APP_ID: ${{ secrets.CLOUDFLARE_ACCESS_APP_ID }}
+          HOSTNAME: syntheticdata.creativeoperations.com
+        run: |
+          CURRENT=$(curl -sSf \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$CLOUDFLARE_ACCESS_APP_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          EXISTS=$(echo "$CURRENT" | jq --arg h "$HOSTNAME" \
+            '[.result.self_hosted_domains // [] | .[] | select(. == $h)] | length')
+          if [ "$EXISTS" = "0" ]; then
+            BODY=$(echo "$CURRENT" | jq --arg h "$HOSTNAME" '
+              .result
+              | del(.id, .uid, .aud, .created_at, .updated_at)
+              | .self_hosted_domains = ((.self_hosted_domains // []) + [$h])
+              | .destinations = ((.destinations // []) + [{"type": "public", "uri": $h}])')
+            curl -sSf -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$CLOUDFLARE_ACCESS_APP_ID" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$BODY"
+            echo "Added to Access app: $HOSTNAME"
+          else
+            echo "Already in Access app: $HOSTNAME"
+          fi
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          JOB_STATUS: ${{ job.status }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          GIT_ACTOR: ${{ github.actor }}
+          GIT_REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEPLOY_URL: https://syntheticdata.creativeoperations.com
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && echo "Slack webhook not configured, skipping." && exit 0
+          SHORT_SHA=${GIT_SHA:0:7}
+          if [ "$JOB_STATUS" = "success" ]; then
+            ICON="✅"; TITLE="Deployment Successful"
+            [ -n "$DEPLOY_URL" ] && DETAIL="*Live at:* <$DEPLOY_URL|$DEPLOY_URL>" || DETAIL="🚀 Deployed successfully!"
+          else
+            ICON="❌"; TITLE="Deployment Failed"
+            DETAIL="🔍 *Something went wrong.* Click the button below to see what failed and why."
+          fi
+          jq -n \
+            --arg title "$ICON  $TITLE" \
+            --arg repo "$GIT_REPO" \
+            --arg commit "$SHORT_SHA - $COMMIT_MSG" \
+            --arg actor "$GIT_ACTOR" \
+            --arg detail "$DETAIL" \
+            --arg run_url "$RUN_URL" \
+            '{
+              blocks: [
+                {type:"header",text:{type:"plain_text",text:$title,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:("*Repository:*  "+$repo)}},
+                {type:"section",text:{type:"mrkdwn",text:("*By:*  "+$actor)}},
+                {type:"section",text:{type:"mrkdwn",text:("*Commit:*  `"+$commit+"`")}},
+                {type:"section",text:{type:"mrkdwn",text:$detail}},
+                {type:"divider"},
+                {type:"actions",elements:[{
+                  type:"button",
+                  text:{type:"plain_text",text:"🔗 View Logs"},
+                  url:$run_url,
+                  action_id:"view_logs"
+                }]}
+              ]
+            }' | curl -s -X POST -H "Content-type: application/json" -d @- "$SLACK_WEBHOOK_URL"
