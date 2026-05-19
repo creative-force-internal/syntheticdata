@@ -3,9 +3,10 @@ import { z } from 'zod';
 import { nanoid } from 'nanoid';
 import fs from 'fs';
 import Database from 'better-sqlite3';
-import { projectStore, jobStore } from '../store/session.store.js';
+import { projectStore, jobStore, groupStore } from '../store/session.store.js';
 import { parsePrismaSchema } from '../services/prisma-parser.service.js';
 import { parseSQLMultiple } from '../services/sql-parser.service.js';
+import { inferFkCandidates } from '../services/fk-inference.service.js';
 import { parseErJson } from '../services/er-parser.service.js';
 import { generateProject } from '../services/multi-generate.service.js';
 import { appendJsonlChunk, readJsonlRows, jobTempPath, getTempDir } from '../services/tempfile.service.js';
@@ -74,7 +75,17 @@ const TableZ = z.object({
 const ProjectBodyZ = z.object({
   name: z.string().min(1),
   tables: z.array(TableZ),
+  groupId: z.string().nullable().optional(),
 });
+
+function validateGroupId(groupId: string | null | undefined, reply: FastifyReply): boolean {
+  if (groupId == null) return true;
+  if (!groupStore.get(groupId)) {
+    reply.code(400).send({ ok: false, error: `Unknown groupId: ${groupId}` });
+    return false;
+  }
+  return true;
+}
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -125,11 +136,13 @@ export async function projectRoutes(app: FastifyInstance) {
   app.post('/projects', async (req, reply) => {
     const parsed = ProjectBodyZ.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, error: parsed.error.message });
+    if (!validateGroupId(parsed.data.groupId, reply)) return;
     const now = new Date().toISOString();
     const project: Project = {
       id: nanoid(),
       name: parsed.data.name,
       tables: sanitizeTableIds(parsed.data.tables as DatasetSchema[]),
+      groupId: parsed.data.groupId ?? null,
       createdAt: now,
       updatedAt: now,
     };
@@ -144,10 +157,12 @@ export async function projectRoutes(app: FastifyInstance) {
     if (!existing) return;
     const parsed = ProjectBodyZ.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ ok: false, error: parsed.error.message });
+    if (!validateGroupId(parsed.data.groupId, reply)) return;
     const updated: Project = {
       ...existing,
       name: parsed.data.name,
       tables: sanitizeTableIds(parsed.data.tables as DatasetSchema[], existing.tables),
+      groupId: parsed.data.groupId === undefined ? existing.groupId ?? null : parsed.data.groupId,
       updatedAt: new Date().toISOString(),
     };
     projectStore.set(updated);
@@ -201,6 +216,7 @@ export async function projectRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ ok: false, error: parsed.error.message });
     try {
       const { tables: parsedTables, warnings } = parseSQLMultiple(parsed.data.sql);
+      const fkCandidates = inferFkCandidates(parsedTables);
       const now = new Date().toISOString();
       const tables: DatasetSchema[] = parsedTables.map(t => ({
         id: nanoid(),
@@ -218,7 +234,39 @@ export async function projectRoutes(app: FastifyInstance) {
       const projectName = parsed.data.name ?? (tables.length === 1 ? tables[0].name : 'Imported Project');
       const project: Project = { id: nanoid(), name: projectName, tables, createdAt: now, updatedAt: now };
       projectStore.set(project);
-      reply.code(201).send({ ok: true, data: project, warnings });
+      reply.code(201).send({ ok: true, data: project, warnings, fkCandidates });
+    } catch (e) {
+      reply.code(400).send({ ok: false, error: `SQL parse error: ${(e as Error).message}` });
+    }
+  });
+
+  // ── Preview: parse SQL + infer FK candidates without persisting ────────────
+  // Two-phase import flow: client previews, shows review modal, then POSTs
+  // the finalised tables to /projects. Additive — leaves /projects/infer/sql
+  // working for clients that don't want the review step.
+
+  app.post('/projects/preview/sql', async (req, reply) => {
+    const parsed = z.object({ sql: z.string().min(1), name: z.string().optional() }).safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ ok: false, error: parsed.error.message });
+    try {
+      const { tables: parsedTables, warnings } = parseSQLMultiple(parsed.data.sql);
+      const fkCandidates = inferFkCandidates(parsedTables);
+      const now = new Date().toISOString();
+      const tables: DatasetSchema[] = parsedTables.map(t => ({
+        id: nanoid(),
+        name: t.tableName,
+        columns: t.columns.map(c => ({
+          ...c,
+          id: nanoid(),
+          poolName: c.indexType === 'primary_key' ? `${t.tableName}.${c.name}` : undefined,
+        })),
+        rules: [],
+        sourceType: 'sql' as const,
+        createdAt: now,
+        updatedAt: now,
+      }));
+      const projectName = parsed.data.name ?? (tables.length === 1 ? tables[0].name : 'Imported Project');
+      reply.send({ ok: true, data: { projectName, tables, warnings, fkCandidates } });
     } catch (e) {
       reply.code(400).send({ ok: false, error: `SQL parse error: ${(e as Error).message}` });
     }

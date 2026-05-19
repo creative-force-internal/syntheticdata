@@ -73,9 +73,30 @@ export interface Project {
   id: string;
   name: string;
   tables: DatasetSchema[];
+  groupId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
+
+export interface FkCandidate {
+  fromTable: string;
+  fromColumn: string;
+  toTable: string;
+  toColumn: string;
+  confidence: number;
+  reasons: string[];
+  selfReference?: boolean;
+}
+
+export interface Group {
+  id: string;
+  name: string;
+  icon: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type GroupWithCount = Group & { projectCount: number };
 
 export interface TableRowConfig {
   tableId: string;

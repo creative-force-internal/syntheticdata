@@ -100,9 +100,9 @@ export function Profile() {
     <div className="flex h-screen overflow-hidden bg-surface">
       <Sidebar />
 
-      <main className="flex-1 ml-64 flex flex-col min-h-screen overflow-y-auto">
+      <main className="flex-1 md:ml-64 flex flex-col min-h-screen overflow-y-auto">
         {/* Top Nav */}
-        <header className="flex items-center justify-between px-8 w-full h-16 sticky top-0 z-50 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
+        <header className="flex items-center justify-between px-4 md:px-8 pl-14 md:pl-8 w-full h-16 sticky top-0 z-30 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
           <div className="flex items-center flex-1 max-w-xl">
             <div className="relative w-full">
               <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-on-surface-variant text-[20px]">search</span>

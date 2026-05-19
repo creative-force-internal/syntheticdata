@@ -131,6 +131,17 @@ export interface Project {
   id: string;
   name: string;
   tables: DatasetSchema[];       // each element is one table
+  groupId?: string | null;       // optional workspace/folder assignment
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─── Group (workspace / folder above projects) ────────────────────────────────
+
+export interface Group {
+  id: string;
+  name: string;
+  icon: string;                  // emoji or short icon name (e.g. "📁" or "folder")
   createdAt: string;
   updatedAt: string;
 }

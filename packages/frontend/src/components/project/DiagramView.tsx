@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow,
   Background,
@@ -11,19 +11,105 @@ import {
   useNodesState,
   ReactFlowProvider,
 } from '@xyflow/react';
-import type { Connection, Edge, Node, NodeProps } from '@xyflow/react';
+import type { Connection, Edge, Node, NodeProps, OnConnectStart, OnConnectEnd } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from '@dagrejs/dagre';
 import { nanoid } from 'nanoid';
-import { Plus, Maximize2, Trash2, Check, X, LayoutGrid, Download, Copy } from 'lucide-react';
+import { Plus, Maximize2, Trash2, Check, X, LayoutGrid, Download, Copy, AlertCircle } from 'lucide-react';
 import type { ColumnSchema, DatasetSchema, ColumnDataType, IndexType } from '../../types/index.js';
 import { useProjectStore } from '../../store/projectStore.js';
+
+// ─── FK validation helpers ────────────────────────────────────────────────────
+
+/** Whether two column data types are valid as parent PK / child FK pair. */
+function fkTypesCompatible(a: ColumnDataType, b: ColumnDataType): boolean {
+  if (a === b) return true;
+  // Common code-first quirk: UUIDs stored as varchar
+  if ((a === 'uuid' && b === 'string') || (a === 'string' && b === 'uuid')) return true;
+  return false;
+}
+
+/**
+ * Decode a Connection into PK side and FK side. Supports reverse drag (FK→PK)
+ * if a non-PK column was somehow the source. Returns null if the connection
+ * isn't a valid FK shape (no PK on either side, or both sides are PK).
+ */
+function resolveFkSides(
+  connection: { sourceHandle?: string | null; targetHandle?: string | null },
+  tables: DatasetSchema[],
+): {
+  pkTable: DatasetSchema; pkCol: ColumnSchema;
+  fkTable: DatasetSchema; fkCol: ColumnSchema;
+  reason: 'ok';
+} | { reason: 'pk-on-pk' | 'no-pk' | 'composite-pk' | 'type-mismatch' | 'self-loop' | 'invalid' } {
+  if (!connection.sourceHandle || !connection.targetHandle) return { reason: 'invalid' };
+  const [srcTableId, srcColId] = connection.sourceHandle.split('__');
+  const [tgtTableId, tgtColId] = connection.targetHandle.split('__');
+  if (!srcTableId || !srcColId || !tgtTableId || !tgtColId) return { reason: 'invalid' };
+  if (srcTableId === tgtTableId && srcColId === tgtColId)   return { reason: 'self-loop' };
+
+  const srcTable = tables.find(t => t.id === srcTableId);
+  const tgtTable = tables.find(t => t.id === tgtTableId);
+  if (!srcTable || !tgtTable) return { reason: 'invalid' };
+  const srcCol = srcTable.columns.find(c => c.id === srcColId);
+  const tgtCol = tgtTable.columns.find(c => c.id === tgtColId);
+  if (!srcCol || !tgtCol) return { reason: 'invalid' };
+
+  const srcIsPk = srcCol.indexType === 'primary_key';
+  const tgtIsPk = tgtCol.indexType === 'primary_key';
+  if (srcIsPk && tgtIsPk) return { reason: 'pk-on-pk' };
+  if (!srcIsPk && !tgtIsPk) return { reason: 'no-pk' };
+
+  const pkTable = srcIsPk ? srcTable : tgtTable;
+  const pkCol   = srcIsPk ? srcCol   : tgtCol;
+  const fkTable = srcIsPk ? tgtTable : srcTable;
+  const fkCol   = srcIsPk ? tgtCol   : srcCol;
+
+  const pkCount = pkTable.columns.filter(c => c.indexType === 'primary_key').length;
+  if (pkCount > 1) return { reason: 'composite-pk' };
+  if (!fkTypesCompatible(pkCol.dataType, fkCol.dataType)) return { reason: 'type-mismatch' };
+
+  return { pkTable, pkCol, fkTable, fkCol, reason: 'ok' };
+}
+
+/** Compute the set of valid target handle IDs for a given drag source. */
+function computeValidTargets(
+  dragSourceHandle: string | null,
+  tables: DatasetSchema[],
+): Set<string> {
+  if (!dragSourceHandle) return new Set();
+  const [srcTableId, srcColId] = dragSourceHandle.split('__');
+  if (!srcTableId || !srcColId) return new Set();
+  const srcTable = tables.find(t => t.id === srcTableId);
+  const srcCol = srcTable?.columns.find(c => c.id === srcColId);
+  if (!srcTable || !srcCol) return new Set();
+
+  // Only PK→FK direction emits a visible source handle today, so we score
+  // potential target handles against the dragged PK column.
+  if (srcCol.indexType !== 'primary_key') return new Set();
+  const pkCount = srcTable.columns.filter(c => c.indexType === 'primary_key').length;
+  if (pkCount > 1) return new Set();  // composite-PK source — skip for v1
+
+  const valid = new Set<string>();
+  for (const t of tables) {
+    for (const c of t.columns) {
+      if (c.indexType === 'primary_key') continue;     // can't drop on a PK
+      if (!fkTypesCompatible(srcCol.dataType, c.dataType)) continue;
+      valid.add(`${t.id}__${c.id}`);
+    }
+  }
+  return valid;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface TableNodeData extends Record<string, unknown> {
   table: DatasetSchema;
   onTableClick: () => void;
+  /** Set during a drag — the source handle ID (`${tableId}__${colId}`). */
+  dragSourceHandle?: string | null;
+  /** Set of target handle IDs valid as drop targets for the current drag. */
+  validTargets?: Set<string> | null;
 }
 
 type TableNodeType = Node<TableNodeData>;
@@ -32,15 +118,16 @@ type DiagramEdge = Edge;
 // ─── TableNode ────────────────────────────────────────────────────────────────
 
 function TableNode({ data }: NodeProps<TableNodeType>) {
-  const { table, onTableClick } = data;
+  const { table, onTableClick, dragSourceHandle, validTargets } = data;
+  const isDragging = !!dragSourceHandle;
 
   return (
     <div
-      className="bg-card border border-border rounded-lg overflow-hidden shadow-lg min-w-[190px] cursor-pointer hover:border-primary/50 transition-colors"
+      className="bg-card border border-border rounded-lg shadow-lg min-w-[190px] cursor-pointer hover:border-primary/50 transition-colors"
       onClick={onTableClick as React.MouseEventHandler}
     >
       {/* Header */}
-      <div className="bg-muted/80 px-3 py-2 border-b border-border">
+      <div className="bg-muted/80 px-3 py-2 border-b border-border rounded-t-lg">
         <span className="text-xs font-semibold font-mono text-foreground">{table.name}</span>
       </div>
 
@@ -51,6 +138,9 @@ function TableNode({ data }: NodeProps<TableNodeType>) {
           const isFK = col.indexType === 'foreign_key';
           const isUQ = col.indexType === 'unique';
           const handleId = `${table.id}__${col.id}`;
+          // During a drag, mark target handles as valid/invalid; outside of a drag, default styling.
+          const isValidTarget = isDragging && validTargets?.has(handleId);
+          const isInvalidTarget = isDragging && !validTargets?.has(handleId) && handleId !== dragSourceHandle;
 
           return (
             <div
@@ -64,9 +154,12 @@ function TableNode({ data }: NodeProps<TableNodeType>) {
                   position={Position.Left}
                   id={handleId}
                   style={{
-                    background: isFK ? '#6366f1' : '#475569',
-                    width: 8, height: 8, left: -4,
-                    opacity: isFK ? 1 : 0.45,
+                    background: isValidTarget ? '#10b981' : isFK ? '#6366f1' : '#475569',
+                    width: isValidTarget ? 12 : 8,
+                    height: isValidTarget ? 12 : 8,
+                    left: isValidTarget ? -6 : -4,
+                    opacity: isInvalidTarget ? 0.15 : isValidTarget ? 1 : isFK ? 1 : 0.45,
+                    transition: 'opacity 120ms, width 120ms, height 120ms, left 120ms, background 120ms',
                   }}
                 />
               )}
@@ -96,7 +189,7 @@ function TableNode({ data }: NodeProps<TableNodeType>) {
                   type="source"
                   position={Position.Right}
                   id={handleId}
-                  style={{ background: '#eab308', width: 8, height: 8, right: -4 }}
+                  style={{ background: '#eab308', width: 12, height: 12, right: -6, cursor: 'crosshair' }}
                 />
               )}
             </div>
@@ -604,6 +697,26 @@ function DiagramFlow({ tables, onTableClick, addTable, updateTable }: FlowProps)
   const [showAddForm, setShowAddForm] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // FK editing state (B1/B2/B3/B4)
+  const [dragSourceHandle, setDragSourceHandle] = useState<string | null>(null);
+  const [selectedEdge, setSelectedEdge] = useState<DiagramEdge | null>(null);
+  const [pendingOverwrite, setPendingOverwrite] = useState<{
+    fkTableId: string; fkColId: string; newRef: string; oldRef: string;
+  } | null>(null);
+  const [feedback, setFeedback] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showFeedback = useCallback((message: string, tone: 'error' | 'info' = 'info') => {
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    setFeedback({ message, tone });
+    feedbackTimerRef.current = setTimeout(() => setFeedback(null), 3500);
+  }, []);
+
+  const validTargets = useMemo(
+    () => computeValidTargets(dragSourceHandle, tables),
+    [dragSourceHandle, tables],
+  );
+
   // Re-layout when the table SET changes (added/removed) but preserve user
   // drags otherwise. We compare the sorted id list to detect set changes.
   const tableIdsKey = tables.map((t) => t.id).sort().join('|');
@@ -618,6 +731,15 @@ function DiagramFlow({ tables, onTableClick, addTable, updateTable }: FlowProps)
     setEdges(buildEdges(tables));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tables]);
+
+  // Push drag state into node.data so TableNode can dim invalid handles.
+  useEffect(() => {
+    setNodes((nds) => nds.map((n) => ({
+      ...n,
+      data: { ...n.data, dragSourceHandle, validTargets },
+    })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragSourceHandle, validTargets]);
 
   function handleAutoArrange() {
     const positions = layoutWithDagre(tables);
@@ -665,48 +787,169 @@ function DiagramFlow({ tables, onTableClick, addTable, updateTable }: FlowProps)
     }
   }
 
-  const onConnect = useCallback(
-    (connection: Connection) => {
-      if (!connection.sourceHandle || !connection.targetHandle) return;
-
-      const [srcTableId, srcColId] = connection.sourceHandle.split('__');
-      const [tgtTableId, tgtColId] = connection.targetHandle.split('__');
-
-      if (!srcTableId || !srcColId || !tgtTableId || !tgtColId) return;
-      if (srcTableId === tgtTableId && srcColId === tgtColId) return;
-
-      const srcTable = tables.find((t) => t.id === srcTableId);
-      const tgtTable = tables.find((t) => t.id === tgtTableId);
-      if (!srcTable || !tgtTable) return;
-
-      const srcCol = srcTable.columns.find((c) => c.id === srcColId);
-      const tgtCol = tgtTable.columns.find((c) => c.id === tgtColId);
-      if (!srcCol || !tgtCol) return;
-
-      // Only allow dragging from PK columns
-      if (srcCol.indexType !== 'primary_key') return;
-
-      const updatedCol = {
-        ...tgtCol,
-        indexType: 'foreign_key' as const,
-        generatorConfig: {
-          ...tgtCol.generatorConfig,
-          poolRef: `${srcTable.name}.${srcCol.name}`,
-        },
+  const applyFk = useCallback(
+    (fkTable: DatasetSchema, fkCol: ColumnSchema, newRef: string, connection: Connection) => {
+      const updatedCol: ColumnSchema = {
+        ...fkCol,
+        indexType: 'foreign_key',
+        generatorConfig: { ...fkCol.generatorConfig, poolRef: newRef },
       };
       updateTable({
-        ...tgtTable,
-        columns: tgtTable.columns.map((c) => (c.id === tgtColId ? updatedCol : c)),
+        ...fkTable,
+        columns: fkTable.columns.map((c) => (c.id === fkCol.id ? updatedCol : c)),
       });
-
       setEdges((eds) =>
         addEdge(
           { ...connection, animated: true, label: 'FK', style: { stroke: '#6366f1' }, labelStyle: { fill: '#a5b4fc', fontSize: 10 } },
           eds,
         ),
       );
+      showFeedback(`Linked ${fkTable.name}.${fkCol.name} → ${newRef}`);
     },
-    [tables, updateTable, setEdges],
+    [updateTable, setEdges, showFeedback],
+  );
+
+  // Predicate used by React Flow during drag to gate which targets accept a drop.
+  const isValidConnection = useCallback(
+    (connection: Connection | Edge) => {
+      const resolved = resolveFkSides(
+        { sourceHandle: connection.sourceHandle ?? null, targetHandle: connection.targetHandle ?? null },
+        tables,
+      );
+      return resolved.reason === 'ok';
+    },
+    [tables],
+  );
+
+  const onConnect = useCallback(
+    (connection: Connection) => {
+      const resolved = resolveFkSides(connection, tables);
+      switch (resolved.reason) {
+        case 'invalid':
+        case 'self-loop':
+          return;
+        case 'pk-on-pk':
+          showFeedback('Target is already a PK — drop on a non-PK column', 'error');
+          return;
+        case 'no-pk':
+          showFeedback('FK relationships need a PK column on one side', 'error');
+          return;
+        case 'composite-pk':
+          showFeedback("Composite PKs aren't supported as FK targets yet", 'error');
+          return;
+        case 'type-mismatch': {
+          // Re-decode to surface specific types in the message
+          if (!connection.sourceHandle || !connection.targetHandle) return;
+          const [stid, scid] = connection.sourceHandle.split('__');
+          const [ttid, tcid] = connection.targetHandle.split('__');
+          const sc = tables.find(t => t.id === stid)?.columns.find(c => c.id === scid);
+          const tc = tables.find(t => t.id === ttid)?.columns.find(c => c.id === tcid);
+          showFeedback(`Type mismatch: ${sc?.dataType ?? '?'} → ${tc?.dataType ?? '?'}`, 'error');
+          return;
+        }
+        case 'ok': {
+          const { pkTable, pkCol, fkTable, fkCol } = resolved;
+          const newRef = `${pkTable.name}.${pkCol.name}`;
+          const oldRef = fkCol.indexType === 'foreign_key' ? fkCol.generatorConfig.poolRef : undefined;
+          if (oldRef && oldRef !== newRef) {
+            setPendingOverwrite({ fkTableId: fkTable.id, fkColId: fkCol.id, newRef, oldRef });
+            return;
+          }
+          if (oldRef === newRef) return;  // already linked, no-op
+          applyFk(fkTable, fkCol, newRef, connection);
+          return;
+        }
+      }
+    },
+    [tables, applyFk, showFeedback],
+  );
+
+  const confirmOverwrite = useCallback(() => {
+    if (!pendingOverwrite) return;
+    const fkTable = tables.find(t => t.id === pendingOverwrite.fkTableId);
+    const fkCol   = fkTable?.columns.find(c => c.id === pendingOverwrite.fkColId);
+    if (!fkTable || !fkCol) { setPendingOverwrite(null); return; }
+    // Synthesize a Connection so applyFk can extend the edge list. The actual
+    // source/target handles are reconstructable but the edge will be rebuilt
+    // by the buildEdges effect when tables update, so an empty connection works.
+    const [parentTable, parentCol] = pendingOverwrite.newRef.split('.');
+    const pkTable = tables.find(t => t.name === parentTable);
+    const pkCol   = pkTable?.columns.find(c => c.name === parentCol);
+    if (!pkTable || !pkCol) { setPendingOverwrite(null); return; }
+    const synthetic: Connection = {
+      source: pkTable.id,
+      sourceHandle: `${pkTable.id}__${pkCol.id}`,
+      target: fkTable.id,
+      targetHandle: `${fkTable.id}__${fkCol.id}`,
+    };
+    applyFk(fkTable, fkCol, pendingOverwrite.newRef, synthetic);
+    setPendingOverwrite(null);
+  }, [pendingOverwrite, tables, applyFk]);
+
+  const onConnectStart: OnConnectStart = useCallback((_event, params) => {
+    setDragSourceHandle(params.handleId || null);
+  }, []);
+
+  const onConnectEnd: OnConnectEnd = useCallback(() => {
+    setDragSourceHandle(null);
+  }, []);
+
+  // Remove FK on edge delete (e.g. user pressed Delete key on a selected edge).
+  const onEdgesDelete = useCallback((deleted: DiagramEdge[]) => {
+    for (const edge of deleted) {
+      if (!edge.targetHandle) continue;
+      const [tgtTableId, tgtColId] = edge.targetHandle.split('__');
+      const tgtTable = tables.find((t) => t.id === tgtTableId);
+      const tgtCol   = tgtTable?.columns.find((c) => c.id === tgtColId);
+      if (!tgtTable || !tgtCol) continue;
+      const newConfig = { ...tgtCol.generatorConfig };
+      delete newConfig.poolRef;
+      delete newConfig.fkNullRate;
+      delete newConfig.fkDistribution;
+      delete newConfig.fkChildrenPerParent;
+      delete newConfig.fkValueWeights;
+      delete newConfig.fkFixedValues;
+      updateTable({
+        ...tgtTable,
+        columns: tgtTable.columns.map((c) =>
+          c.id === tgtCol.id ? { ...c, indexType: 'none' as const, generatorConfig: newConfig } : c,
+        ),
+      });
+      showFeedback(`Removed FK on ${tgtTable.name}.${tgtCol.name}`);
+    }
+    if (selectedEdge && deleted.some((e) => e.id === selectedEdge.id)) {
+      setSelectedEdge(null);
+    }
+  }, [tables, updateTable, selectedEdge, showFeedback]);
+
+  const onEdgeClick = useCallback((_event: React.MouseEvent, edge: DiagramEdge) => {
+    setSelectedEdge(edge);
+  }, []);
+
+  // Resolve selected edge to the FK column (for the inspector panel)
+  const selectedFk = useMemo(() => {
+    if (!selectedEdge?.targetHandle) return null;
+    const [tgtTableId, tgtColId] = selectedEdge.targetHandle.split('__');
+    const fkTable = tables.find((t) => t.id === tgtTableId);
+    const fkCol   = fkTable?.columns.find((c) => c.id === tgtColId);
+    if (!fkTable || !fkCol) return null;
+    return { fkTable, fkCol };
+  }, [selectedEdge, tables]);
+
+  const updateFkConfig = useCallback(
+    (patch: Partial<ColumnSchema['generatorConfig']>) => {
+      if (!selectedFk) return;
+      const { fkTable, fkCol } = selectedFk;
+      const updatedCol: ColumnSchema = {
+        ...fkCol,
+        generatorConfig: { ...fkCol.generatorConfig, ...patch },
+      };
+      updateTable({
+        ...fkTable,
+        columns: fkTable.columns.map((c) => (c.id === fkCol.id ? updatedCol : c)),
+      });
+    },
+    [selectedFk, updateTable],
   );
 
   function handleAdd(table: DatasetSchema) {
@@ -722,6 +965,12 @@ function DiagramFlow({ tables, onTableClick, addTable, updateTable }: FlowProps)
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onConnectStart={onConnectStart}
+        onConnectEnd={onConnectEnd}
+        onEdgesDelete={onEdgesDelete}
+        onEdgeClick={onEdgeClick}
+        isValidConnection={isValidConnection}
+        deleteKeyCode="Delete"
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}
@@ -802,9 +1051,134 @@ function DiagramFlow({ tables, onTableClick, addTable, updateTable }: FlowProps)
       {/* Drag hint */}
       <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
         <span className="text-[10px] text-muted-foreground bg-card/70 border border-border px-2 py-1 rounded-full">
-          Drag 🔑 PK handle → column to create FK relationship
+          Drag 🔑 PK handle → column to create FK · click edge to inspect · Delete to remove
         </span>
       </div>
+
+      {/* Feedback banner */}
+      {feedback && (
+        <div
+          className={`absolute bottom-12 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-4 py-2 rounded-lg border shadow-lg text-xs font-medium transition-all ${
+            feedback.tone === 'error'
+              ? 'bg-destructive/10 border-destructive/30 text-destructive'
+              : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
+          }`}
+        >
+          {feedback.tone === 'error' && <AlertCircle className="w-3.5 h-3.5 shrink-0" />}
+          {feedback.message}
+        </div>
+      )}
+
+      {/* FK edge inspector panel */}
+      {selectedFk && (
+        <div className="absolute bottom-3 right-3 z-20 bg-card border border-border rounded-xl shadow-2xl w-72 overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-muted/40">
+            <span className="text-xs font-semibold">FK: {selectedFk.fkTable.name}.{selectedFk.fkCol.name}</span>
+            <button onClick={() => setSelectedEdge(null)} className="text-muted-foreground hover:text-foreground">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="p-4 space-y-3 text-xs">
+            <div>
+              <span className="text-muted-foreground">References: </span>
+              <span className="font-mono">{selectedFk.fkCol.generatorConfig.poolRef ?? '—'}</span>
+            </div>
+
+            {/* Null rate */}
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-muted-foreground">Null rate</label>
+              <input
+                type="number"
+                min={0} max={1} step={0.05}
+                className="w-20 bg-background border border-border rounded px-2 py-0.5 text-xs text-right focus:outline-none focus:ring-1 focus:ring-primary"
+                value={selectedFk.fkCol.generatorConfig.fkNullRate ?? 0}
+                onChange={(e) => updateFkConfig({ fkNullRate: parseFloat(e.target.value) || 0 })}
+              />
+            </div>
+
+            {/* Distribution */}
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-muted-foreground">Distribution</label>
+              <select
+                className="bg-background border border-border rounded px-2 py-0.5 text-xs focus:outline-none"
+                value={selectedFk.fkCol.generatorConfig.fkDistribution ?? 'uniform'}
+                onChange={(e) => updateFkConfig({ fkDistribution: e.target.value as 'uniform' | 'weighted' | 'fixed_per_parent' })}
+              >
+                <option value="uniform">Uniform</option>
+                <option value="weighted">Weighted</option>
+                <option value="fixed_per_parent">Fixed per parent</option>
+              </select>
+            </div>
+
+            {/* Children per parent (only relevant for fixed_per_parent) */}
+            {selectedFk.fkCol.generatorConfig.fkDistribution === 'fixed_per_parent' && (
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-muted-foreground">Children/parent</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number" min={0} step={1}
+                    className="w-14 bg-background border border-border rounded px-2 py-0.5 text-xs text-right focus:outline-none focus:ring-1 focus:ring-primary"
+                    placeholder="min"
+                    value={selectedFk.fkCol.generatorConfig.fkChildrenPerParent?.min ?? 1}
+                    onChange={(e) => updateFkConfig({
+                      fkChildrenPerParent: {
+                        min: parseInt(e.target.value) || 1,
+                        max: selectedFk.fkCol.generatorConfig.fkChildrenPerParent?.max ?? 3,
+                      },
+                    })}
+                  />
+                  <span className="text-muted-foreground">–</span>
+                  <input
+                    type="number" min={0} step={1}
+                    className="w-14 bg-background border border-border rounded px-2 py-0.5 text-xs text-right focus:outline-none focus:ring-1 focus:ring-primary"
+                    placeholder="max"
+                    value={selectedFk.fkCol.generatorConfig.fkChildrenPerParent?.max ?? 3}
+                    onChange={(e) => updateFkConfig({
+                      fkChildrenPerParent: {
+                        min: selectedFk.fkCol.generatorConfig.fkChildrenPerParent?.min ?? 1,
+                        max: parseInt(e.target.value) || 3,
+                      },
+                    })}
+                  />
+                </div>
+              </div>
+            )}
+
+            <p className="text-[10px] text-muted-foreground pt-1">Press Delete to remove this FK relationship.</p>
+          </div>
+        </div>
+      )}
+
+      {/* Overwrite-confirm dialog */}
+      {pendingOverwrite && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/40">
+          <div className="bg-card border border-border rounded-xl shadow-2xl w-80 overflow-hidden">
+            <div className="px-5 py-4 border-b border-border bg-muted/40">
+              <span className="text-sm font-semibold">Replace existing FK?</span>
+            </div>
+            <div className="px-5 py-4 text-xs space-y-2">
+              <p className="text-muted-foreground">This column already references:</p>
+              <p className="font-mono text-foreground">{pendingOverwrite.oldRef}</p>
+              <p className="text-muted-foreground mt-2">Replace with:</p>
+              <p className="font-mono text-foreground">{pendingOverwrite.newRef}</p>
+            </div>
+            <div className="flex gap-2 px-5 py-3 border-t border-border">
+              <button
+                onClick={() => setPendingOverwrite(null)}
+                className="flex-1 py-1.5 rounded-lg text-xs border border-border hover:bg-muted transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmOverwrite}
+                className="flex-1 py-1.5 rounded-lg text-xs bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+              >
+                Replace
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

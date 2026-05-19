@@ -371,7 +371,7 @@ export function GeneratorPicker({ current, currentFakerFn, currentLocale, curren
   const selectedLocaleOption = LOCALE_GROUPS.flatMap(g => g.locales).find(l => l.value === selectedLocale);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/60 p-4 overflow-y-auto" onClick={onClose}>
       <div
         className="bg-surface-container border border-outline-variant rounded-xl shadow-2xl w-full max-w-2xl max-h-[88vh] flex flex-col"
         onClick={e => e.stopPropagation()}

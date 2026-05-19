@@ -55,7 +55,23 @@ db.exec(`
     result_path TEXT,
     created_at  TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS groups (
+    id         TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
+
+// Idempotent ALTER: add projects.group_id column on first run only.
+// SQLite has no "ADD COLUMN IF NOT EXISTS"; introspect via PRAGMA.
+{
+  const cols = db.prepare(`PRAGMA table_info(projects)`).all() as { name: string }[];
+  if (!cols.some(c => c.name === 'group_id')) {
+    db.exec(`ALTER TABLE projects ADD COLUMN group_id TEXT`);
+  }
+}
 
 // ─── Startup: expire done jobs whose result files are missing ─────────────────
 

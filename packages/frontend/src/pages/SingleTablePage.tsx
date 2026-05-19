@@ -16,9 +16,9 @@ export function SingleTablePage() {
     <div className="flex h-screen overflow-hidden bg-surface">
       <Sidebar />
 
-      <div className="flex-1 ml-64 flex flex-col overflow-hidden">
+      <div className="flex-1 md:ml-64 flex flex-col overflow-hidden">
         {/* Progress bar */}
-        <div className="shrink-0 flex items-center gap-0 px-8 h-12 border-b border-surface-container bg-surface/95">
+        <div className="shrink-0 flex items-center gap-0 px-4 md:px-8 pl-14 md:pl-8 h-12 border-b border-surface-container bg-surface/95 overflow-x-auto">
           {STEP_LABELS.map((label, i) => (
             <div key={label} className="flex items-center">
               <div className="flex items-center gap-2">

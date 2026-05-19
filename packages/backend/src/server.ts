@@ -10,6 +10,8 @@ import { exportRoutes } from './routes/export.routes.js';
 import { projectRoutes } from './routes/project.routes.js';
 import { statsRoutes } from './routes/stats.routes.js';
 import { templateRoutes } from './routes/template.routes.js';
+import { groupRoutes } from './routes/group.routes.js';
+import { mcpRoutes } from './routes/mcp.routes.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
 
@@ -36,6 +38,8 @@ await app.register(exportRoutes, { prefix: '/api/v1' });
 await app.register(projectRoutes, { prefix: '/api/v1' });
 await app.register(statsRoutes, { prefix: '/api/v1' });
 await app.register(templateRoutes, { prefix: '/api/v1' });
+await app.register(groupRoutes, { prefix: '/api/v1' });
+await app.register(mcpRoutes);
 
 app.get('/health', async () => ({ ok: true, ts: new Date().toISOString() }));
 
