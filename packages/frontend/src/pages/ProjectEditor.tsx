@@ -157,37 +157,67 @@ export function ProjectEditor() {
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-surface">
       {/* Header */}
-      <header className="shrink-0 flex items-center gap-3 px-4 h-14 border-b border-surface-container bg-surface/95 backdrop-blur-md">
-        <Link
-          to="/"
-          className="flex items-center gap-1.5 text-xs font-label uppercase tracking-widest text-on-surface-variant hover:text-on-surface transition-colors"
-        >
-          <ArrowLeft className="w-3.5 h-3.5" />
-          Projects
-        </Link>
+      <header className="shrink-0 border-b border-surface-container bg-surface/95 backdrop-blur-md">
+        {/* Row 1: back link + name + save (always single row, wraps in worst case) */}
+        <div className="flex items-center gap-3 px-4 h-14">
+          <Link
+            to="/"
+            className="flex items-center gap-1.5 text-xs font-label uppercase tracking-widest text-on-surface-variant hover:text-on-surface transition-colors shrink-0"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Projects</span>
+          </Link>
 
-        <span className="text-outline-variant">|</span>
+          <span className="text-outline-variant hidden sm:inline">|</span>
 
-        {/* Editable project name */}
-        <input
-          className="bg-transparent text-sm font-semibold font-headline focus:outline-none focus:border-b focus:border-primary min-w-0 flex-1 max-w-xs text-on-surface"
-          value={projectName}
-          onChange={(e) => setProjectName(e.target.value)}
-          onBlur={handleSave}
-          onKeyDown={(e) => e.key === 'Enter' && handleSave()}
-        />
+          {/* Editable project name */}
+          <input
+            className="bg-transparent text-sm font-semibold font-headline focus:outline-none focus:border-b focus:border-primary min-w-0 flex-1 text-on-surface"
+            value={projectName}
+            onChange={(e) => setProjectName(e.target.value)}
+            onBlur={handleSave}
+            onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+          />
 
-        <span className="text-[10px] font-label text-on-surface-variant hidden sm:block uppercase tracking-widest">
-          {project.tables.length} {project.tables.length === 1 ? 'table' : 'tables'}
-        </span>
+          <span className="text-[10px] font-label text-on-surface-variant hidden md:block uppercase tracking-widest shrink-0">
+            {project.tables.length} {project.tables.length === 1 ? 'table' : 'tables'}
+          </span>
 
-        {/* Tab switcher */}
-        <nav className="flex items-center gap-0.5 mx-auto">
+          {/* Tab switcher — inline on md+ */}
+          <nav className="hidden md:flex items-center gap-0.5 mx-auto">
+            {TABS.map((t) => (
+              <Link
+                key={t.id}
+                to={`/projects/${projectId}/${t.id}`}
+                className={`px-3 py-1.5 font-label text-[10px] uppercase tracking-widest rounded transition-colors ${
+                  activeTab === t.id
+                    ? 'bg-surface-container text-studio-blue border-b-2 border-studio-blue font-bold'
+                    : 'text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high'
+                }`}
+              >
+                {t.label}
+              </Link>
+            ))}
+          </nav>
+
+          {/* Save button */}
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="flex items-center gap-1.5 text-xs font-label uppercase tracking-widest bg-primary text-on-primary-fixed px-3 md:px-4 py-2 rounded-md hover:brightness-110 disabled:opacity-50 transition-all shrink-0"
+          >
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            <span className="hidden sm:inline">Save</span>
+          </button>
+        </div>
+
+        {/* Row 2 (mobile only): tab switcher in horizontal-scroll strip */}
+        <nav className="md:hidden flex items-center gap-0.5 px-2 pb-2 overflow-x-auto whitespace-nowrap">
           {TABS.map((t) => (
             <Link
               key={t.id}
               to={`/projects/${projectId}/${t.id}`}
-              className={`px-3 py-1.5 font-label text-[10px] uppercase tracking-widest rounded transition-colors ${
+              className={`px-3 py-1.5 font-label text-[10px] uppercase tracking-widest rounded transition-colors shrink-0 ${
                 activeTab === t.id
                   ? 'bg-surface-container text-studio-blue border-b-2 border-studio-blue font-bold'
                   : 'text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high'
@@ -197,16 +227,6 @@ export function ProjectEditor() {
             </Link>
           ))}
         </nav>
-
-        {/* Save button */}
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="flex items-center gap-1.5 text-xs font-label uppercase tracking-widest bg-primary text-on-primary-fixed px-4 py-2 rounded-md hover:brightness-110 disabled:opacity-50 transition-all"
-        >
-          {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-          Save
-        </button>
       </header>
 
       {saveError && (
@@ -218,7 +238,7 @@ export function ProjectEditor() {
       {/* Main content */}
       <main className="flex-1 overflow-hidden">
         {activeTab === 'tables' && (
-          <div className="flex h-full">
+          <div className="flex h-full relative">
             <TableSidebar
               tables={project.tables}
               activeTableId={activeTableId}

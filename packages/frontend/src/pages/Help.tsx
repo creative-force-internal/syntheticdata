@@ -47,9 +47,9 @@ export function Help() {
     <div className="flex h-screen overflow-hidden bg-surface">
       <Sidebar />
 
-      <main className="flex-1 ml-64 flex flex-col min-h-screen overflow-hidden">
+      <main className="flex-1 md:ml-64 flex flex-col min-h-screen overflow-hidden">
         {/* Top Nav */}
-        <header className="flex items-center justify-between px-8 w-full h-16 sticky top-0 z-50 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
+        <header className="flex items-center justify-between px-4 md:px-8 pl-14 md:pl-8 w-full h-16 sticky top-0 z-30 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
           <div className="flex items-center gap-3">
             <span className="material-symbols-outlined text-primary text-[20px]">help_outline</span>
             <span className="text-[10px] font-label uppercase tracking-widest text-on-surface">Help & Docs</span>
@@ -91,7 +91,7 @@ export function Help() {
 
           {/* Content */}
           <div className="flex-1 overflow-y-auto">
-            <article className="max-w-3xl mx-auto px-8 py-12 space-y-16 pb-24">
+            <article className="max-w-3xl mx-auto px-4 md:px-8 py-8 md:py-12 space-y-12 md:space-y-16 pb-16 md:pb-24">
               {/* Hero */}
               <header className="space-y-3 border-b border-outline-variant/10 pb-10">
                 <p className="font-label text-[10px] uppercase tracking-widest text-primary">Documentation</p>

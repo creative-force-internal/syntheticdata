@@ -50,9 +50,9 @@ export function Dashboard() {
     <div className="flex h-screen overflow-hidden bg-surface">
       <Sidebar />
 
-      <main className="flex-1 ml-64 flex flex-col min-h-screen overflow-hidden">
+      <main className="flex-1 md:ml-64 flex flex-col min-h-screen overflow-hidden">
         {/* Top Nav */}
-        <header className="flex items-center justify-between px-8 w-full h-16 sticky top-0 z-50 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
+        <header className="flex items-center justify-between px-4 md:px-8 pl-14 md:pl-8 w-full h-16 sticky top-0 z-30 bg-surface/80 backdrop-blur-md border-b border-surface-container shrink-0">
           <div className="flex items-center flex-1 max-w-xl">
             <div className="relative w-full">
               <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-on-surface-variant text-[20px]">search</span>
@@ -72,11 +72,11 @@ export function Dashboard() {
         </header>
 
         {/* Content */}
-        <section className="flex-1 overflow-y-auto p-8 space-y-8">
+        <section className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 md:space-y-8">
           {/* Hero */}
           <div className="flex flex-col md:flex-row md:items-end justify-between gap-6">
             <div>
-              <h2 className="text-4xl font-bold font-headline tracking-tight text-on-surface">System Overview</h2>
+              <h2 className="text-2xl md:text-4xl font-bold font-headline tracking-tight text-on-surface">System Overview</h2>
               <p className="text-on-surface-variant mt-2 max-w-lg text-sm">
                 Synthetic Data Generation Engine is active.{' '}
                 <span className="text-tertiary">{projects.length} project{projects.length !== 1 ? 's' : ''}</span> loaded across all clusters.
@@ -158,12 +158,6 @@ export function Dashboard() {
             </div>
 
             <div className="bg-surface-container rounded-xl border border-outline-variant/10 overflow-hidden">
-              <div className="grid grid-cols-12 px-6 py-4 bg-surface-container-high border-b border-outline-variant/10 font-label text-[10px] tracking-widest uppercase text-on-surface-variant">
-                <div className="col-span-5">Project Name</div>
-                <div className="col-span-3 text-center">Tables</div>
-                <div className="col-span-4 text-right">Last Updated</div>
-              </div>
-
               {projects.length === 0 ? (
                 <div className="px-6 py-12 text-center">
                   <span className="material-symbols-outlined text-[36px] text-on-surface-variant/30 block mb-3">folder_open</span>
@@ -176,31 +170,40 @@ export function Dashboard() {
                   </button>
                 </div>
               ) : (
-                projects.slice(0, 6).map((project, i) => (
-                  <div
-                    key={project.id}
-                    onClick={() => navigate(`/projects/${project.id}/tables`)}
-                    className={`grid grid-cols-12 px-6 py-5 hover:bg-surface-bright/30 transition-colors cursor-pointer items-center ${i < projects.slice(0, 6).length - 1 ? 'border-b border-outline-variant/5' : ''}`}
-                  >
-                    <div className="col-span-5 flex items-center gap-4">
-                      <div className="w-2 h-2 rounded-full bg-primary" />
-                      <div>
-                        <div className="font-bold text-sm">{project.name}</div>
-                        <div className="text-[10px] text-on-surface-variant font-label mt-1">
-                          ID: {project.id.slice(0, 12)}
+                <div className="overflow-x-auto">
+                  <div className="min-w-[640px]">
+                    <div className="grid grid-cols-12 px-6 py-4 bg-surface-container-high border-b border-outline-variant/10 font-label text-[10px] tracking-widest uppercase text-on-surface-variant">
+                      <div className="col-span-5">Project Name</div>
+                      <div className="col-span-3 text-center">Tables</div>
+                      <div className="col-span-4 text-right">Last Updated</div>
+                    </div>
+                    {projects.slice(0, 6).map((project, i) => (
+                      <div
+                        key={project.id}
+                        onClick={() => navigate(`/projects/${project.id}/tables`)}
+                        className={`grid grid-cols-12 px-6 py-5 hover:bg-surface-bright/30 transition-colors cursor-pointer items-center ${i < projects.slice(0, 6).length - 1 ? 'border-b border-outline-variant/5' : ''}`}
+                      >
+                        <div className="col-span-5 flex items-center gap-4">
+                          <div className="w-2 h-2 rounded-full bg-primary" />
+                          <div>
+                            <div className="font-bold text-sm">{project.name}</div>
+                            <div className="text-[10px] text-on-surface-variant font-label mt-1">
+                              ID: {project.id.slice(0, 12)}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="col-span-3 flex justify-center">
+                          <span className="px-3 py-1 bg-surface-variant rounded text-[11px] font-label text-on-surface">
+                            {project.tables.length} TABLE{project.tables.length !== 1 ? 'S' : ''}
+                          </span>
+                        </div>
+                        <div className="col-span-4 text-right text-on-surface-variant text-[11px] font-label">
+                          {new Date(project.updatedAt).toLocaleDateString()}
                         </div>
                       </div>
-                    </div>
-                    <div className="col-span-3 flex justify-center">
-                      <span className="px-3 py-1 bg-surface-variant rounded text-[11px] font-label text-on-surface">
-                        {project.tables.length} TABLE{project.tables.length !== 1 ? 'S' : ''}
-                      </span>
-                    </div>
-                    <div className="col-span-4 text-right text-on-surface-variant text-[11px] font-label">
-                      {new Date(project.updatedAt).toLocaleDateString()}
-                    </div>
+                    ))}
                   </div>
-                ))
+                </div>
               )}
             </div>
           </div>

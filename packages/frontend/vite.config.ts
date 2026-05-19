@@ -9,6 +9,7 @@ export default defineConfig({
     allowedHosts: ['syntheticdata.creativeoperations.com'],
     proxy: {
       '/api': 'http://localhost:3001',
+      '/mcp': 'http://localhost:3001',
     },
     historyApiFallback: true,
   },

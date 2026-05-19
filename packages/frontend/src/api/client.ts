@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ColumnSchema, DatasetSchema, GeneratedRow, Project, TableRowConfig } from '../types/index.js';
+import type { ColumnSchema, DatasetSchema, FkCandidate, GeneratedRow, Group, GroupWithCount, Project, TableRowConfig } from '../types/index.js';
 
 const api = axios.create({ baseURL: '/api/v1' });
 
@@ -91,14 +91,22 @@ export async function getProject(id: string): Promise<Project> {
   return data.data;
 }
 
-export async function createProject(name: string, tables: DatasetSchema[]): Promise<Project> {
-  const { data } = await api.post<{ ok: true; data: Project }>('/projects', { name, tables });
+export async function createProject(name: string, tables: DatasetSchema[], groupId?: string | null): Promise<Project> {
+  const { data } = await api.post<{ ok: true; data: Project }>('/projects', { name, tables, groupId });
   return data.data;
 }
 
-export async function updateProject(id: string, name: string, tables: DatasetSchema[]): Promise<Project> {
-  const { data } = await api.put<{ ok: true; data: Project }>(`/projects/${id}`, { name, tables });
+export async function updateProject(id: string, name: string, tables: DatasetSchema[], groupId?: string | null): Promise<Project> {
+  const body: Record<string, unknown> = { name, tables };
+  if (groupId !== undefined) body.groupId = groupId;
+  const { data } = await api.put<{ ok: true; data: Project }>(`/projects/${id}`, body);
   return data.data;
+}
+
+/** Move a project to a different group (or null = Uncategorized). Fetches first to preserve tables. */
+export async function moveProjectToGroup(id: string, groupId: string | null): Promise<Project> {
+  const existing = await getProject(id);
+  return updateProject(id, existing.name, existing.tables, groupId);
 }
 
 export async function deleteProject(id: string): Promise<void> {
@@ -121,6 +129,18 @@ export async function inferFromPrisma(source: string, name?: string): Promise<Pr
 
 export async function inferProjectFromSql(sql: string, name?: string): Promise<Project> {
   const { data } = await api.post<{ ok: true; data: Project }>('/projects/infer/sql', { sql, name });
+  return data.data;
+}
+
+/** Parse SQL + run FK inference without persisting. Used by the review-modal import flow. */
+export async function previewProjectFromSql(
+  sql: string,
+  name?: string,
+): Promise<{ projectName: string; tables: DatasetSchema[]; warnings: string[]; fkCandidates: FkCandidate[] }> {
+  const { data } = await api.post<{
+    ok: true;
+    data: { projectName: string; tables: DatasetSchema[]; warnings: string[]; fkCandidates: FkCandidate[] };
+  }>('/projects/preview/sql', { sql, name });
   return data.data;
 }
 
@@ -202,6 +222,28 @@ export async function getStats(): Promise<{
   lastActivity: string | null;
 }> {
   const { data } = await api.get<{ ok: true; data: { totalJobsCompleted: number; totalRowsGenerated: number; lastActivity: string | null } }>('/stats');
+  return data.data;
+}
+
+// ─── Groups (workspace / folder) ──────────────────────────────────────────────
+
+export async function listGroups(): Promise<GroupWithCount[]> {
+  const { data } = await api.get<{ ok: true; data: GroupWithCount[] }>('/groups');
+  return data.data;
+}
+
+export async function createGroup(name: string, icon: string): Promise<Group> {
+  const { data } = await api.post<{ ok: true; data: Group }>('/groups', { name, icon });
+  return data.data;
+}
+
+export async function updateGroup(id: string, patch: { name?: string; icon?: string }): Promise<Group> {
+  const { data } = await api.put<{ ok: true; data: Group }>(`/groups/${id}`, patch);
+  return data.data;
+}
+
+export async function deleteGroup(id: string): Promise<{ deleted: string; reassignedProjects: number }> {
+  const { data } = await api.delete<{ ok: true; data: { deleted: string; reassignedProjects: number } }>(`/groups/${id}`);
   return data.data;
 }
 
