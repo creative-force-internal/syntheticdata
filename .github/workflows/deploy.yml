@@ -146,36 +146,7 @@ jobs:
             echo "Registered: $HOSTNAME"
           else
             echo "Already registered: $HOSTNAME"
-          fi
-
-      - name: Add hostname to Cloudflare Access app
-        if: env.CLOUDFLARE_ACCESS_APP_ID != ''
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_ACCESS_APP_ID: ${{ secrets.CLOUDFLARE_ACCESS_APP_ID }}
-          HOSTNAME: syntheticdata.creativeoperations.com
-        run: |
-          CURRENT=$(curl -sSf \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$CLOUDFLARE_ACCESS_APP_ID" \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
-          EXISTS=$(echo "$CURRENT" | jq --arg h "$HOSTNAME" \
-            '[.result.self_hosted_domains // [] | .[] | select(. == $h)] | length')
-          if [ "$EXISTS" = "0" ]; then
-            BODY=$(echo "$CURRENT" | jq --arg h "$HOSTNAME" '
-              .result
-              | del(.id, .uid, .aud, .created_at, .updated_at)
-              | .self_hosted_domains = ((.self_hosted_domains // []) + [$h])
-              | .destinations = ((.destinations // []) + [{"type": "public", "uri": $h}])')
-            curl -sSf -X PUT \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$CLOUDFLARE_ACCESS_APP_ID" \
-              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$BODY"
-            echo "Added to Access app: $HOSTNAME"
-          else
-            echo "Already in Access app: $HOSTNAME"
-          fi
+          fi      
 
       - name: Notify Slack
         if: always()
