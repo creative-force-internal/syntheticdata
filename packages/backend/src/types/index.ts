@@ -198,6 +198,17 @@ export interface InferredSchema {
   warnings: string[];
 }
 
+// ─── D1-compat API keys ───────────────────────────────────────────────────────
+
+export interface ProjectApiKey {
+  id: string;
+  projectId: string;
+  name: string;
+  keyPrefix: string;   // e.g. "sdg_a1b2c3d4" — safe to display
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
 // ─── Error types ──────────────────────────────────────────────────────────────
 
 export class CircularDependencyError extends Error {

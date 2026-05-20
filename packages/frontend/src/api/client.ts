@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ColumnSchema, DatasetSchema, FkCandidate, GeneratedRow, Group, GroupWithCount, Project, TableRowConfig } from '../types/index.js';
+import type { ColumnSchema, DatasetSchema, FkCandidate, GeneratedRow, Group, GroupWithCount, Project, ProjectApiKey, TableRowConfig } from '../types/index.js';
 
 const api = axios.create({ baseURL: '/api/v1' });
 
@@ -245,6 +245,22 @@ export async function updateGroup(id: string, patch: { name?: string; icon?: str
 export async function deleteGroup(id: string): Promise<{ deleted: string; reassignedProjects: number }> {
   const { data } = await api.delete<{ ok: true; data: { deleted: string; reassignedProjects: number } }>(`/groups/${id}`);
   return data.data;
+}
+
+// ─── D1-compat API keys ───────────────────────────────────────────────────────
+
+export async function listApiKeys(projectId: string): Promise<ProjectApiKey[]> {
+  const { data } = await api.get<{ ok: true; data: ProjectApiKey[] }>(`/projects/${projectId}/api-keys`);
+  return data.data;
+}
+
+export async function createApiKey(projectId: string, name: string): Promise<ProjectApiKey & { key: string }> {
+  const { data } = await api.post<{ ok: true; data: ProjectApiKey & { key: string } }>(`/projects/${projectId}/api-keys`, { name });
+  return data.data;
+}
+
+export async function revokeApiKey(projectId: string, keyId: string): Promise<void> {
+  await api.delete(`/projects/${projectId}/api-keys/${keyId}`);
 }
 
 // ─── Export download helpers ──────────────────────────────────────────────────

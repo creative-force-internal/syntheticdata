@@ -1,0 +1,400 @@
+/**
+ * D1-compatible HTTP API for synthetic project data.
+ *
+ * Wire protocol mirrors Cloudflare D1's REST API so users can use the
+ * standard D1 `Database` class pointed at this server:
+ *
+ *   const db = new Database({
+ *     fetch: (path, init) =>
+ *       fetch(`http://localhost:3001/db/${projectId}${path}`, {
+ *         ...init,
+ *         headers: { ...init?.headers, Authorization: `Bearer ${apiKey}` },
+ *       }),
+ *   });
+ *
+ * D1-compat endpoints (auth required):
+ *   POST /db/:projectId/query    — SELECT / batch queries → D1Success | D1Success[]
+ *   POST /db/:projectId/execute  — DML writes            → D1Success (changes/lastRowId)
+ *   POST /db/:projectId/dump     — SQLite binary stream   → ArrayBuffer
+ *
+ * API key management (standard ApiResponse wrapper):
+ *   GET    /api/v1/projects/:projectId/api-keys
+ *   POST   /api/v1/projects/:projectId/api-keys
+ *   DELETE /api/v1/projects/:projectId/api-keys/:keyId
+ */
+
+import type { FastifyInstance } from 'fastify';
+import BetterSqlite3 from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { nanoid } from 'nanoid';
+import { db as mainDb } from '../db/database.js';
+import { projectStore } from '../store/session.store.js';
+import { buildSqliteDb } from '../services/sqlite-export.service.js';
+import { getTempDir } from '../services/tempfile.service.js';
+import type { GenerationJob, ProjectApiKey } from '../types/index.js';
+
+// ─── Security ─────────────────────────────────────────────────────────────────
+
+// ATTACH/DETACH open arbitrary host files — block unconditionally.
+const BLOCKED_SQL_RE = /\b(attach|detach)\b/i;
+
+const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+// ─── API key helpers ──────────────────────────────────────────────────────────
+
+function hashKey(key: string): string {
+  return crypto.createHash('sha256').update(key).digest('hex');
+}
+
+function generateApiKey(): { key: string; prefix: string; hash: string } {
+  const raw = crypto.randomBytes(32).toString('hex'); // 256-bit entropy
+  const key = `sdg_${raw}`;
+  const prefix = `sdg_${raw.slice(0, 8)}`;
+  return { key, prefix, hash: hashKey(key) };
+}
+
+// ─── D1 DB cache with build lock ─────────────────────────────────────────────
+
+const d1Cache = new Map<string, { dbPath: string; jobId: string }>();
+// Coalesces concurrent cold-cache requests — only one rebuild runs per project.
+const d1Building = new Map<string, Promise<void>>();
+
+async function resolveD1Db(projectId: string): Promise<string | null> {
+  type JobRow = { id: string; data: string };
+  const row = mainDb.prepare(`
+    SELECT id, data FROM jobs
+    WHERE status = 'done'
+      AND json_extract(data, '$.projectId') = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(projectId) as JobRow | undefined;
+
+  if (!row) return null;
+
+  const job = JSON.parse(row.data) as GenerationJob;
+  if (!job.resultPaths) return null;
+
+  const dbPath = path.join(getTempDir(), `d1_${projectId}.db`);
+  const cached = d1Cache.get(projectId);
+
+  if (!cached || cached.jobId !== row.id || !fs.existsSync(dbPath)) {
+    let build = d1Building.get(projectId);
+    if (!build) {
+      const project = projectStore.get(projectId);
+      if (!project) return null;
+      build = buildSqliteDb(project.tables, job.resultPaths, dbPath)
+        .then(() => { d1Cache.set(projectId, { dbPath, jobId: row.id }); })
+        .finally(() => { d1Building.delete(projectId); });
+      d1Building.set(projectId, build);
+    }
+    await build;
+  }
+
+  return dbPath;
+}
+
+// ─── D1 wire types ────────────────────────────────────────────────────────────
+
+type D1Success<T = Record<string, unknown>> = {
+  results: T[];
+  lastRowId: number | null;
+  changes: number;
+  duration: number;
+};
+type D1Error = { error: string };
+
+// ─── Body validation ──────────────────────────────────────────────────────────
+
+type ParsedStmt = { sql: string; params: unknown[] };
+
+function parseSingleBody(body: unknown): ParsedStmt | D1Error {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'Body must be a JSON object with sql string' };
+  }
+  const { sql, params } = body as Record<string, unknown>;
+  if (typeof sql !== 'string' || !sql.trim()) {
+    return { error: 'sql must be a non-empty string' };
+  }
+  if (params !== undefined && !Array.isArray(params)) {
+    return { error: 'params must be an array' };
+  }
+  return { sql, params: (params as unknown[]) ?? [] };
+}
+
+function parseBatchBody(body: unknown): ParsedStmt[] | D1Error {
+  if (!Array.isArray(body)) return { error: 'Batch body must be a JSON array' };
+  const out: ParsedStmt[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const r = parseSingleBody(body[i]);
+    if ('error' in r) return { error: `Statement[${i}]: ${r.error}` };
+    out.push(r);
+  }
+  return out;
+}
+
+// ─── SQL execution ────────────────────────────────────────────────────────────
+
+function execQuery<T>(
+  db: BetterSqlite3.Database,
+  sql: string,
+  params: unknown[],
+): D1Success<T> | D1Error {
+  if (BLOCKED_SQL_RE.test(sql)) return { error: 'ATTACH and DETACH are not permitted' };
+  const t0 = Date.now();
+  try {
+    const rows = db.prepare(sql).all(...params) as T[];
+    return { results: rows, lastRowId: null, changes: 0, duration: Date.now() - t0 };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
+function execStatement(
+  db: BetterSqlite3.Database,
+  sql: string,
+  params: unknown[],
+): D1Success<never> | D1Error {
+  if (BLOCKED_SQL_RE.test(sql)) return { error: 'ATTACH and DETACH are not permitted' };
+  const t0 = Date.now();
+  try {
+    const info = db.prepare(sql).run(...params);
+    return {
+      results: [],
+      lastRowId: typeof info.lastInsertRowid === 'bigint'
+        ? Number(info.lastInsertRowid)
+        : (info.lastInsertRowid as number | null),
+      changes: info.changes,
+      duration: Date.now() - t0,
+    };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+function authenticate(authHeader: string | undefined, projectId: string): boolean {
+  if (!authHeader?.startsWith('Bearer ')) return false;
+  const hash = hashKey(authHeader.slice(7));
+  const row = mainDb.prepare(`
+    SELECT id FROM project_api_keys WHERE key_hash = ? AND project_id = ?
+  `).get(hash, projectId) as { id: string } | undefined;
+  if (!row) return false;
+  mainDb.prepare(`UPDATE project_api_keys SET last_used_at = ? WHERE id = ?`)
+    .run(new Date().toISOString(), row.id);
+  return true;
+}
+
+// ─── Route plugin ─────────────────────────────────────────────────────────────
+
+export async function d1Routes(app: FastifyInstance) {
+
+  // ── POST /db/:projectId/query ──────────────────────────────────────────────
+  // Supports single { sql, params? } and batch [{ sql, params? }].
+  // Batch runs atomically inside a transaction (matches D1 behavior).
+
+  app.post<{ Params: { projectId: string } }>(
+    '/db/:projectId/query',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!PROJECT_ID_RE.test(projectId)) {
+        return reply.code(400).send({ error: 'Invalid project ID' });
+      }
+      if (!authenticate(req.headers.authorization, projectId)) {
+        return reply.code(401).send({ error: 'Unauthorized' });
+      }
+
+      const dbPath = await resolveD1Db(projectId);
+      if (!dbPath) {
+        return reply.code(404).send({ error: 'No generated data. Run generate first.' });
+      }
+
+      if (Array.isArray(req.body)) {
+        // ── Batch (atomic) ─────────────────────────────────────────────────
+        const parsed = parseBatchBody(req.body);
+        if ('error' in parsed) return reply.code(400).send(parsed);
+
+        const db = new BetterSqlite3(dbPath);
+        try {
+          let results: D1Success[] = [];
+          // Wrapping in a transaction makes the batch atomic:
+          // if any statement throws, all preceding changes roll back.
+          const runBatch = db.transaction(() => {
+            results = parsed.map(s => {
+              if (BLOCKED_SQL_RE.test(s.sql)) {
+                throw new Error('ATTACH and DETACH are not permitted');
+              }
+              const t0 = Date.now();
+              const rows = db.prepare(s.sql).all(...s.params) as Record<string, unknown>[];
+              return { results: rows, lastRowId: null, changes: 0, duration: Date.now() - t0 };
+            });
+          });
+          runBatch();
+          return reply.send(results);
+        } catch (e) {
+          return reply.code(400).send({ error: (e as Error).message });
+        } finally {
+          db.close();
+        }
+      } else {
+        // ── Single ─────────────────────────────────────────────────────────
+        const parsed = parseSingleBody(req.body);
+        if ('error' in parsed) return reply.code(400).send(parsed);
+
+        const db = new BetterSqlite3(dbPath);
+        try {
+          const result = execQuery(db, parsed.sql, parsed.params);
+          if ('error' in result) return reply.code(400).send(result);
+          return reply.send(result);
+        } finally {
+          db.close();
+        }
+      }
+    },
+  );
+
+  // ── POST /db/:projectId/execute ────────────────────────────────────────────
+
+  app.post<{ Params: { projectId: string } }>(
+    '/db/:projectId/execute',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!PROJECT_ID_RE.test(projectId)) {
+        return reply.code(400).send({ error: 'Invalid project ID' });
+      }
+      if (!authenticate(req.headers.authorization, projectId)) {
+        return reply.code(401).send({ error: 'Unauthorized' });
+      }
+
+      const parsed = parseSingleBody(req.body);
+      if ('error' in parsed) return reply.code(400).send(parsed);
+
+      const dbPath = await resolveD1Db(projectId);
+      if (!dbPath) {
+        return reply.code(404).send({ error: 'No generated data. Run generate first.' });
+      }
+
+      const db = new BetterSqlite3(dbPath);
+      try {
+        const result = execStatement(db, parsed.sql, parsed.params);
+        if ('error' in result) return reply.code(400).send(result);
+        return reply.send(result);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  // ── POST /db/:projectId/dump ───────────────────────────────────────────────
+  // Streams the SQLite file — avoids loading the entire DB into memory.
+
+  app.post<{ Params: { projectId: string } }>(
+    '/db/:projectId/dump',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!PROJECT_ID_RE.test(projectId)) {
+        return reply.code(400).send({ error: 'Invalid project ID' });
+      }
+      if (!authenticate(req.headers.authorization, projectId)) {
+        return reply.code(401).send({ error: 'Unauthorized' });
+      }
+
+      const dbPath = await resolveD1Db(projectId);
+      if (!dbPath) {
+        return reply.code(404).send({ error: 'No generated data. Run generate first.' });
+      }
+
+      return reply
+        .type('application/x-sqlite3')
+        .send(fs.createReadStream(dbPath));
+    },
+  );
+
+  // ── GET /api/v1/projects/:projectId/api-keys ──────────────────────────────
+
+  app.get<{ Params: { projectId: string } }>(
+    '/api/v1/projects/:projectId/api-keys',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!projectStore.get(projectId)) {
+        return reply.code(404).send({ ok: false, error: 'Project not found' });
+      }
+      type Row = {
+        id: string; project_id: string; name: string;
+        key_prefix: string; created_at: string; last_used_at: string | null;
+      };
+      const rows = mainDb.prepare(`
+        SELECT id, project_id, name, key_prefix, created_at, last_used_at
+        FROM project_api_keys
+        WHERE project_id = ?
+        ORDER BY created_at DESC
+      `).all(projectId) as Row[];
+
+      const keys: ProjectApiKey[] = rows.map(r => ({
+        id: r.id,
+        projectId: r.project_id,
+        name: r.name,
+        keyPrefix: r.key_prefix,
+        createdAt: r.created_at,
+        lastUsedAt: r.last_used_at,
+      }));
+      return reply.send({ ok: true, data: keys });
+    },
+  );
+
+  // ── POST /api/v1/projects/:projectId/api-keys ─────────────────────────────
+  // Returns the full key ONCE — not stored in plaintext anywhere.
+
+  app.post<{ Params: { projectId: string }; Body: { name?: string } }>(
+    '/api/v1/projects/:projectId/api-keys',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!projectStore.get(projectId)) {
+        return reply.code(404).send({ ok: false, error: 'Project not found' });
+      }
+      const name = (req.body?.name ?? '').trim() || 'Default';
+      const { key, prefix, hash } = generateApiKey();
+      const id = nanoid();
+      const now = new Date().toISOString();
+
+      mainDb.prepare(`
+        INSERT INTO project_api_keys (id, project_id, name, key_hash, key_prefix, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(id, projectId, name, hash, prefix, now);
+
+      return reply.code(201).send({
+        ok: true,
+        data: {
+          id,
+          projectId,
+          name,
+          keyPrefix: prefix,
+          key,
+          createdAt: now,
+          lastUsedAt: null,
+        } satisfies ProjectApiKey & { key: string },
+      });
+    },
+  );
+
+  // ── DELETE /api/v1/projects/:projectId/api-keys/:keyId ────────────────────
+
+  app.delete<{ Params: { projectId: string; keyId: string } }>(
+    '/api/v1/projects/:projectId/api-keys/:keyId',
+    async (req, reply) => {
+      const { projectId, keyId } = req.params;
+      if (!projectStore.get(projectId)) {
+        return reply.code(404).send({ ok: false, error: 'Project not found' });
+      }
+      const result = mainDb.prepare(`
+        DELETE FROM project_api_keys WHERE id = ? AND project_id = ?
+      `).run(keyId, projectId);
+      if (result.changes === 0) {
+        return reply.code(404).send({ ok: false, error: 'API key not found' });
+      }
+      return reply.send({ ok: true });
+    },
+  );
+}
