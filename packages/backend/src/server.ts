@@ -11,9 +11,22 @@ import { projectRoutes } from './routes/project.routes.js';
 import { statsRoutes } from './routes/stats.routes.js';
 import { templateRoutes } from './routes/template.routes.js';
 import { groupRoutes } from './routes/group.routes.js';
+import rateLimit from '@fastify/rate-limit';
 import { mcpRoutes } from './routes/mcp.routes.js';
+import { d1Routes } from './routes/d1-compat.routes.js';
 
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } });
+const app = Fastify({
+  logger: {
+    level: process.env.LOG_LEVEL ?? 'info',
+    serializers: {
+      // Strip Authorization header from all request logs — prevents API key leakage.
+      req(req) {
+        const { authorization: _redacted, ...safeHeaders } = req.headers ?? {};
+        return { method: req.method, url: req.url, hostname: req.hostname, headers: safeHeaders };
+      },
+    },
+  },
+});
 
 // CORS_ORIGIN: comma-separated list, "*" for any origin, or unset.
 // When the backend serves the frontend itself (FRONTEND_DIST set), CORS is
@@ -29,6 +42,22 @@ if (corsOrigin !== false) {
   await app.register(cors, { origin: corsOrigin });
 }
 
+// Rate limit D1 query/execute endpoints — scoped per projectId, not per IP,
+// so shared NAT/proxy environments don't cross-contaminate project limits.
+await app.register(rateLimit, {
+  max: 60,
+  timeWindow: '1 minute',
+  // allowList returning true skips rate limiting for non-D1 routes.
+  allowList: (req) => !req.url.startsWith('/db/'),
+  keyGenerator: (req: { params: unknown; ip: string }) => {
+    const projectId = (req.params as Record<string, string> | undefined)?.projectId;
+    return `d1:${projectId ?? req.ip}`;
+  },
+  errorResponseBuilder: (_req: unknown, context: { after: string }) => ({
+    error: `Rate limit exceeded. Retry after ${context.after}.`,
+  }),
+});
+
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB ?? 10);
 await app.register(multipart, { limits: { fileSize: maxUploadMb * 1024 * 1024 } });
 
@@ -40,6 +69,7 @@ await app.register(statsRoutes, { prefix: '/api/v1' });
 await app.register(templateRoutes, { prefix: '/api/v1' });
 await app.register(groupRoutes, { prefix: '/api/v1' });
 await app.register(mcpRoutes);
+await app.register(d1Routes);
 
 app.get('/health', async () => ({ ok: true, ts: new Date().toISOString() }));
 

@@ -118,4 +118,15 @@ export interface GenerationJob {
 export type AppStep = 'import' | 'schema' | 'generate' | 'preview';
 
 // Project editor tabs
-export type ProjectTab = 'tables' | 'diagram' | 'generate' | 'export' | 'query';
+export type ProjectTab = 'tables' | 'diagram' | 'generate' | 'export' | 'query' | 'api-keys';
+
+// ─── D1-compat API keys ───────────────────────────────────────────────────────
+
+export interface ProjectApiKey {
+  id: string;
+  projectId: string;
+  name: string;
+  keyPrefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+}

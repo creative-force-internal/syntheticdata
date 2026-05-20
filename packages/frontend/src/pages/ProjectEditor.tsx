@@ -11,9 +11,10 @@ import { DiagramView } from '../components/project/DiagramView.js';
 import { MultiTableGenerate } from '../components/project/MultiTableGenerate.js';
 import { MultiTableExport } from '../components/project/MultiTableExport.js';
 import { QueryPanel } from '../components/project/QueryPanel.js';
+import { ApiKeysPanel } from '../components/project/ApiKeysPanel.js';
 import { SchemaEditor } from '../components/schema/SchemaEditor.js';
 
-const VALID_TABS = new Set<ProjectTab>(['tables', 'diagram', 'generate', 'export', 'query']);
+const VALID_TABS = new Set<ProjectTab>(['tables', 'diagram', 'generate', 'export', 'query', 'api-keys']);
 
 const TABS: { id: ProjectTab; label: string }[] = [
   { id: 'tables', label: 'Tables' },
@@ -21,6 +22,7 @@ const TABS: { id: ProjectTab; label: string }[] = [
   { id: 'generate', label: 'Generate' },
   { id: 'export', label: 'Export' },
   { id: 'query', label: 'Query' },
+  { id: 'api-keys', label: 'API Keys' },
 ];
 
 function makeEmptyTable(): DatasetSchema {
@@ -284,6 +286,12 @@ export function ProjectEditor() {
         {activeTab === 'query' && (
           <div className="h-full overflow-hidden">
             <QueryPanel />
+          </div>
+        )}
+
+        {activeTab === 'api-keys' && (
+          <div className="h-full overflow-hidden">
+            <ApiKeysPanel />
           </div>
         )}
       </main>
