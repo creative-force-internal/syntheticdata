@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react';
-import { Play, Download, Database, RefreshCw } from 'lucide-react';
-import { queryProjectData, projectSqliteUrl } from '../../api/client.js';
+import { useEffect, useRef, useState } from 'react';
+import { Play, Download, Database, RefreshCw, HardDrive } from 'lucide-react';
+import { queryProjectData, queryProjectSavedData, getProjectDataInfo, projectSqliteUrl } from '../../api/client.js';
 import { useProjectStore } from '../../store/projectStore.js';
+import type { ProjectDataInfo } from '../../types/index.js';
 
 export function QueryPanel() {
   const { project, jobId } = useProjectStore();
@@ -11,7 +12,22 @@ export function QueryPanel() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<{ rows: Record<string, unknown>[]; columns: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dataInfo, setDataInfo] = useState<ProjectDataInfo | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Check for saved project data on mount / project change
+  useEffect(() => {
+    if (!project?.id) return;
+    getProjectDataInfo(project.id)
+      .then(setDataInfo)
+      .catch(() => setDataInfo(null));
+  }, [project?.id]);
+
+  const hasSavedData = dataInfo?.hasSavedData ?? false;
+  // Tables list: prefer saved db's table names when available, else schema tables
+  const displayTables = hasSavedData && dataInfo?.tableNames?.length
+    ? dataInfo.tableNames
+    : tables.map(t => t.name);
 
   function insertSnippet(tableName: string) {
     const snippet = `SELECT * FROM "${tableName}" LIMIT 100;`;
@@ -20,12 +36,16 @@ export function QueryPanel() {
   }
 
   async function handleRun() {
-    if (!jobId || !sql.trim()) return;
+    if (!sql.trim()) return;
+    if (!hasSavedData && !jobId) return;
+    if (hasSavedData && !project) return;
     setRunning(true);
     setError(null);
     setResult(null);
     try {
-      const res = await queryProjectData(jobId, sql.trim());
+      const res = hasSavedData
+        ? await queryProjectSavedData(project!.id, sql.trim())
+        : await queryProjectData(jobId!, sql.trim());
       setResult(res);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error
@@ -43,6 +63,8 @@ export function QueryPanel() {
     }
   }
 
+  const canQuery = hasSavedData || !!jobId;
+  // Keep noJob for the download link (still job-based)
   const noJob = !jobId;
 
   return (
@@ -51,10 +73,21 @@ export function QueryPanel() {
       <div className="shrink-0 flex items-center gap-2 px-4 py-2.5 border-b border-border bg-card/40">
         <Database className="w-4 h-4 text-muted-foreground" />
         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">SQL Query</span>
+        {hasSavedData && dataInfo?.savedAt && (
+          <span className="flex items-center gap-1 text-[10px] text-green-400 border border-green-500/30 bg-green-500/10 px-2 py-0.5 rounded">
+            <HardDrive className="w-3 h-3" />
+            Saved {new Date(dataInfo.savedAt).toLocaleDateString()}
+          </span>
+        )}
+        {!hasSavedData && jobId && (
+          <span className="text-[10px] text-yellow-400 border border-yellow-500/30 bg-yellow-500/10 px-2 py-0.5 rounded">
+            Session only — save to persist
+          </span>
+        )}
         <div className="flex-1" />
-        {jobId && (
+        {!noJob && (
           <a
-            href={projectSqliteUrl(jobId)}
+            href={projectSqliteUrl(jobId!)}
             download
             className="flex items-center gap-1.5 text-xs border border-border px-3 py-1.5 rounded-lg hover:bg-muted transition-colors"
           >
@@ -72,8 +105,8 @@ export function QueryPanel() {
             <textarea
               ref={textareaRef}
               className="w-full h-28 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary resize-none"
-              placeholder={noJob ? 'Generate data first to enable querying.' : 'SELECT * FROM "users" LIMIT 100;\n\n(Ctrl+Enter to run)'}
-              disabled={noJob}
+              placeholder={!canQuery ? 'Generate data and click "Save to DB" to enable querying.' : 'SELECT * FROM "users" LIMIT 100;\n\n(Ctrl+Enter to run)'}
+              disabled={!canQuery}
               value={sql}
               onChange={e => setSql(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -82,7 +115,7 @@ export function QueryPanel() {
             <div className="flex items-center gap-2">
               <button
                 onClick={handleRun}
-                disabled={noJob || running || !sql.trim()}
+                disabled={!canQuery || running || !sql.trim()}
                 className="flex items-center gap-2 bg-primary text-primary-foreground px-4 py-1.5 rounded-lg text-xs font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
               >
                 {running ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
@@ -144,24 +177,24 @@ export function QueryPanel() {
             {!result && !error && !running && (
               <div className="flex flex-col items-center justify-center h-40 text-muted-foreground gap-2">
                 <Database className="w-8 h-8 opacity-30" />
-                <p className="text-xs">{noJob ? 'Run generation first to enable queries.' : 'Write a query above and press Run.'}</p>
+                <p className="text-xs">{!canQuery ? 'Generate data then click "Save to DB" in the Generate tab.' : 'Write a query above and press Run.'}</p>
               </div>
             )}
           </div>
         </div>
 
         {/* Right: table chips */}
-        {tables.length > 0 && (
+        {displayTables.length > 0 && (
           <div className="w-48 shrink-0 border-l border-border overflow-y-auto p-3 space-y-1">
             <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">Tables</p>
-            {tables.map(t => (
+            {displayTables.map(name => (
               <button
-                key={t.id}
-                onClick={() => insertSnippet(t.name)}
-                disabled={noJob}
+                key={name}
+                onClick={() => insertSnippet(name)}
+                disabled={!canQuery}
                 className="w-full text-left px-2 py-1.5 rounded-md text-xs font-mono hover:bg-muted transition-colors disabled:opacity-40 truncate"
               >
-                {t.name}
+                {name}
               </button>
             ))}
           </div>

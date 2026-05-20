@@ -120,6 +120,12 @@ export type AppStep = 'import' | 'schema' | 'generate' | 'preview';
 // Project editor tabs
 export type ProjectTab = 'tables' | 'diagram' | 'generate' | 'export' | 'query' | 'api-keys';
 
+export interface ProjectDataInfo {
+  hasSavedData: boolean;
+  savedAt?: string;
+  tableNames?: string[];
+}
+
 // ─── D1-compat API keys ───────────────────────────────────────────────────────
 
 export interface ProjectApiKey {
