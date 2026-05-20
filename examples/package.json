@@ -1,0 +1,17 @@
+{
+  "name": "nodejs-db-client-example",
+  "version": "1.0.0",
+  "description": "Simple Node.js application for testing database client",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": ["database", "d1", "example"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@cloudflare/d1": "^0.2.0"
+  }
+}
