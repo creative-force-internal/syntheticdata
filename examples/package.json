@@ -11,9 +11,7 @@
   "keywords": ["database", "d1", "example"],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "@cloudflare/d1": "^0.2.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
