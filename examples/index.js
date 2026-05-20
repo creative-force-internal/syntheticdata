@@ -1,37 +1,83 @@
-import { D1Database } from '@cloudflare/d1';
+// Simple database client using HTTP fetch API
+class DatabaseClient {
+  constructor(config) {
+    this.baseUrl = config.baseUrl;
+    this.dbId = config.dbId;
+    this.authToken = config.authToken;
+  }
 
-// Initialize database client with HTTP fetch
-const db = new D1Database({
-  fetch: (path, init) =>
-    fetch(`http://localhost:3001/db/fxbzPZWubqvnk7nLGuaqZ${path}`, {
-      ...init,
+  async query(sql, params = []) {
+    const url = `${this.baseUrl}/db/${this.dbId}/query`;
+    
+    const response = await fetch(url, {
+      method: 'POST',
       headers: {
-        ...init?.headers,
-        Authorization: 'Bearer <your-key>',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.authToken}`,
       },
-    }),
-});
+      body: JSON.stringify({ sql, params }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Database error: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async execute(sql, params = []) {
+    const url = `${this.baseUrl}/db/${this.dbId}/execute`;
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.authToken}`,
+      },
+      body: JSON.stringify({ sql, params }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Database error: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+}
 
 async function runExample() {
   try {
-    console.log('📦 Connected to database...\n');
+    console.log('📦 Initializing database client...\n');
+
+    const db = new DatabaseClient({
+      baseUrl: 'http://localhost:3001',
+      dbId: 'fxbzPZWubqvnk7nLGuaqZ',
+      authToken: '<your-key>',
+    });
 
     // Example 1: SELECT query
     console.log('1️⃣ Executing SELECT query...');
-    const selectResult = await db.prepare('SELECT * FROM "table" LIMIT 100').all();
-    console.log('Results:', selectResult.results);
+    try {
+      const selectResult = await db.query('SELECT * FROM "table" LIMIT 100');
+      console.log('Results:', selectResult);
+    } catch (e) {
+      console.log('⚠️ SELECT example failed (expected if table doesn\'t exist):', e.message);
+    }
     console.log('');
 
     // Example 2: INSERT query
     console.log('2️⃣ Executing INSERT query...');
-    const insertResult = await db
-      .prepare('INSERT INTO "table" (col) VALUES (?)')
-      .bind('value')
-      .run();
-    console.log('Insert successful:', insertResult.success);
+    try {
+      const insertResult = await db.execute('INSERT INTO "table" (col) VALUES (?)', ['value']);
+      console.log('Insert result:', insertResult);
+    } catch (e) {
+      console.log('⚠️ INSERT example failed (expected if table doesn\'t exist):', e.message);
+    }
     console.log('');
 
-    console.log('✅ All examples completed successfully!');
+    console.log('✅ Examples completed!');
+    console.log('\n📝 Note: Replace <your-key> with your actual authentication token');
+    console.log('         and update the dbId and table names as needed.');
   } catch (error) {
     console.error('❌ Error:', error.message);
     process.exit(1);

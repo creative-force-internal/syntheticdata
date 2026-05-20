@@ -11,7 +11,5 @@
   "keywords": ["database", "d1", "example"],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "@cloudflare/d1": "^0.2.0"
-  }
+  "dependencies": {}
 }
