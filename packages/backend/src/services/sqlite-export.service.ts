@@ -8,7 +8,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import readline from 'readline';
-import type { DatasetSchema } from '../types/index.js';
+import type { ColumnDataType, DatasetSchema } from '../types/index.js';
 
 // ─── SQLite type inference ────────────────────────────────────────────────────
 
@@ -17,6 +17,91 @@ function inferSqliteType(value: unknown): string {
   if (typeof value === 'number') return Number.isInteger(value) ? 'INTEGER' : 'REAL';
   if (typeof value === 'boolean') return 'INTEGER';
   return 'TEXT';
+}
+
+function dataTypeToSqlite(dt: ColumnDataType): string {
+  if (dt === 'integer') return 'INTEGER';
+  if (dt === 'float') return 'REAL';
+  if (dt === 'boolean') return 'INTEGER';
+  return 'TEXT';
+}
+
+// ─── Schema diff + ALTER ──────────────────────────────────────────────────────
+
+/**
+ * Diff the project schema against the existing SQLite DB and apply ALTER TABLE
+ * statements in-place, preserving existing rows.
+ *
+ * Operations performed:
+ *   - New table in schema   → CREATE TABLE
+ *   - Table removed         → DROP TABLE
+ *   - New column in table   → ALTER TABLE … ADD COLUMN
+ *   - Column removed        → ALTER TABLE … DROP COLUMN (SQLite ≥ 3.35)
+ */
+export function updateSqliteSchema(tables: DatasetSchema[], dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+
+  try {
+    const existingTableRows = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+      .all() as { name: string }[];
+    const existingTableNames = new Set(existingTableRows.map(r => r.name));
+
+    const newTableNames = new Set(
+      tables.map(t => t.name.replace(/[^a-zA-Z0-9_]/g, '_')),
+    );
+
+    // Drop tables removed from schema
+    for (const { name } of existingTableRows) {
+      if (!newTableNames.has(name)) {
+        db.exec(`DROP TABLE IF EXISTS "${name}"`);
+      }
+    }
+
+    for (const table of tables) {
+      if (table.columns.length === 0) continue;
+      const tableName = table.name.replace(/[^a-zA-Z0-9_]/g, '_');
+
+      if (!existingTableNames.has(tableName)) {
+        // Brand-new table — create empty
+        const colDefs = table.columns
+          .map(c => `"${c.name.replace(/"/g, '""')}" ${dataTypeToSqlite(c.dataType)}`)
+          .join(', ');
+        db.exec(`CREATE TABLE "${tableName}" (${colDefs})`);
+      } else {
+        // Table exists — diff columns
+        const existingCols = db
+          .prepare(`PRAGMA table_info("${tableName}")`)
+          .all() as { name: string }[];
+        const existingColNames = new Set(existingCols.map(c => c.name));
+        const newColNames = new Set(table.columns.map(c => c.name));
+
+        // Add new columns
+        for (const col of table.columns) {
+          if (!existingColNames.has(col.name)) {
+            const safeName = col.name.replace(/"/g, '""');
+            db.exec(
+              `ALTER TABLE "${tableName}" ADD COLUMN "${safeName}" ${dataTypeToSqlite(col.dataType)}`,
+            );
+          }
+        }
+
+        // Drop removed columns (SQLite ≥ 3.35 — silently skip if unsupported)
+        for (const col of existingCols) {
+          if (!newColNames.has(col.name)) {
+            try {
+              db.exec(`ALTER TABLE "${tableName}" DROP COLUMN "${col.name.replace(/"/g, '""')}"`);
+            } catch {
+              // SQLite version too old or column has a constraint — leave it
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    db.close();
+  }
 }
 
 // ─── Main builder ─────────────────────────────────────────────────────────────

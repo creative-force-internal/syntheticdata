@@ -2,15 +2,18 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { nanoid } from 'nanoid';
 import fs from 'fs';
+import path from 'path';
 import Database from 'better-sqlite3';
 import { projectStore, jobStore, groupStore } from '../store/session.store.js';
+import { dataDir } from '../db/database.js';
 import { parsePrismaSchema } from '../services/prisma-parser.service.js';
 import { parseSQLMultiple } from '../services/sql-parser.service.js';
 import { inferFkCandidates } from '../services/fk-inference.service.js';
 import { parseErJson } from '../services/er-parser.service.js';
 import { generateProject } from '../services/multi-generate.service.js';
 import { appendJsonlChunk, readJsonlRows, jobTempPath, getTempDir } from '../services/tempfile.service.js';
-import { buildSqliteDb } from '../services/sqlite-export.service.js';
+import { buildSqliteDb, updateSqliteSchema } from '../services/sqlite-export.service.js';
+import { buildZipFromDb } from '../services/zip-export.service.js';
 import { GenerationCancelledError } from '../types/index.js';
 import type { DatasetSchema, Project, TableRowConfig } from '../types/index.js';
 
@@ -166,6 +169,16 @@ export async function projectRoutes(app: FastifyInstance) {
       updatedAt: new Date().toISOString(),
     };
     projectStore.set(updated);
+
+    const projectDbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+    if (fs.existsSync(projectDbPath)) {
+      try {
+        updateSqliteSchema(updated.tables, projectDbPath);
+      } catch (e) {
+        app.log.warn({ err: e, projectId: req.params.id }, 'Failed to update project DB schema');
+      }
+    }
+
     reply.send({ ok: true, data: updated });
   });
 
@@ -478,7 +491,123 @@ export async function projectRoutes(app: FastifyInstance) {
     },
   );
 
-  // ── SQL query against generated data ───────────────────────────────────────
+  // ── Save generated data to a persistent per-project SQLite file ───────────
+
+  app.post<{ Params: { id: string }; Body: { jobId: string } }>(
+    '/projects/:id/save-data',
+    async (req, reply) => {
+      if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
+
+      const project = getProject(req.params.id, reply);
+      if (!project) return;
+
+      const { jobId } = req.body ?? {};
+      if (!SafeIdRe.test(jobId ?? '')) return reply.code(400).send({ ok: false, error: 'invalid jobId' });
+
+      const job = jobStore.get(jobId);
+      if (!job) return reply.code(404).send({ ok: false, error: 'Job not found' });
+      if (job.status !== 'done') return reply.code(400).send({ ok: false, error: 'Job not complete' });
+      if (job.projectId !== req.params.id) return reply.code(400).send({ ok: false, error: 'Job does not belong to this project' });
+      if (!job.resultPaths) return reply.code(400).send({ ok: false, error: 'No result data in job' });
+
+      const projectDataDir = path.join(dataDir, 'project-data');
+      await fs.promises.mkdir(projectDataDir, { recursive: true });
+      const dbPath = path.join(projectDataDir, `${req.params.id}.db`);
+
+      await buildSqliteDb(project.tables, job.resultPaths, dbPath);
+
+      reply.send({ ok: true, data: { savedAt: new Date().toISOString() } });
+    },
+  );
+
+  // ── Check whether a project has saved data ─────────────────────────────────
+
+  app.get<{ Params: { id: string } }>(
+    '/projects/:id/data-info',
+    async (req, reply) => {
+      if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
+
+      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+
+      if (!fs.existsSync(dbPath)) {
+        return reply.send({ ok: true, data: { hasSavedData: false } });
+      }
+
+      const savedAt = fs.statSync(dbPath).mtime.toISOString();
+      let tableNames: string[] = [];
+      try {
+        const pdb = new Database(dbPath, { readonly: true });
+        tableNames = (pdb.prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`).all() as { name: string }[]).map(r => r.name);
+        pdb.close();
+      } catch (e) {
+        app.log.warn({ err: e, projectId: req.params.id }, 'Failed to read project db tables');
+      }
+
+      reply.send({ ok: true, data: { hasSavedData: true, savedAt, tableNames } });
+    },
+  );
+
+  // ── Export saved project data as ZIP ──────────────────────────────────────
+
+  app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
+    '/projects/:id/export/zip',
+    async (req, reply) => {
+      if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
+
+      const project = getProject(req.params.id, reply);
+      if (!project) return;
+
+      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+      if (!fs.existsSync(dbPath)) {
+        return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
+      }
+
+      const format = (['csv', 'json', 'sql'].includes(req.query.format ?? '')
+        ? req.query.format
+        : 'csv') as 'csv' | 'json' | 'sql';
+
+      const pdb = new Database(dbPath, { readonly: true });
+      const tableNames = (
+        pdb.prepare(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`).all() as { name: string }[]
+      ).map(r => r.name);
+      pdb.close();
+
+      const zipStream = buildZipFromDb(dbPath, tableNames, format);
+      const safeProjName = project.name.replace(/\s+/g, '_');
+
+      reply
+        .header('Content-Type', 'application/zip')
+        .header('Content-Disposition', `attachment; filename="${safeProjName}_synthetic.zip"`);
+
+      return reply.send(zipStream);
+    },
+  );
+
+  // ── Export saved project data as SQLite .db ────────────────────────────────
+
+  app.get<{ Params: { id: string } }>(
+    '/projects/:id/export/sqlite',
+    async (req, reply) => {
+      if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
+
+      const project = getProject(req.params.id, reply);
+      if (!project) return;
+
+      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+      if (!fs.existsSync(dbPath)) {
+        return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
+      }
+
+      const safeName = project.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      reply
+        .header('Content-Type', 'application/x-sqlite3')
+        .header('Content-Disposition', `attachment; filename="${safeName}.db"`);
+
+      return reply.send(fs.createReadStream(dbPath));
+    },
+  );
+
+  // ── SQL query against saved data ───────────────────────────────────────────
 
   // Statement-shape blocklist: tokens that must not appear at the top level
   // of the user's SQL. Combined with `readonly: true` on the connection,
@@ -551,6 +680,45 @@ export async function projectRoutes(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, error: (e as Error).message });
       } finally {
         db.close();
+      }
+    },
+  );
+
+  // ── SQL query against persistent project data db ───────────────────────────
+
+  app.post<{ Params: { projectId: string }; Body: { sql: string } }>(
+    '/projects/:projectId/query-saved',
+    async (req, reply) => {
+      const { projectId } = req.params;
+      if (!SafeIdRe.test(projectId)) return reply.code(400).send({ ok: false, error: 'invalid projectId' });
+
+      const { sql } = req.body;
+      if (!sql?.trim()) return reply.code(400).send({ ok: false, error: 'Missing sql' });
+
+      const trimmed = sql.trim();
+      if (!/^(select|with)\b/i.test(trimmed)) {
+        return reply.code(400).send({ ok: false, error: 'Only SELECT queries are allowed' });
+      }
+      if (FORBIDDEN_KEYWORDS_RE.test(trimmed)) {
+        return reply.code(400).send({ ok: false, error: 'Only read-only queries are allowed' });
+      }
+
+      const dbPath = path.join(dataDir, 'project-data', `${projectId}.db`);
+      if (!fs.existsSync(dbPath)) {
+        return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
+      }
+
+      const limitedSql = /\blimit\b/i.test(trimmed) ? trimmed : `${trimmed} LIMIT 1001`;
+      const pdb = new Database(dbPath, { readonly: true });
+      try {
+        const stmt = pdb.prepare(limitedSql);
+        const rows = stmt.all() as Record<string, unknown>[];
+        const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+        return reply.send({ ok: true, data: { rows: rows.slice(0, 1000), columns } });
+      } catch (e) {
+        return reply.code(400).send({ ok: false, error: (e as Error).message });
+      } finally {
+        pdb.close();
       }
     },
   );

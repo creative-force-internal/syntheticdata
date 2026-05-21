@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { ColumnSchema, DatasetSchema, FkCandidate, GeneratedRow, Group, GroupWithCount, Project, ProjectApiKey, TableRowConfig } from '../types/index.js';
+import type { ColumnSchema, DatasetSchema, FkCandidate, GeneratedRow, Group, GroupWithCount, Project, ProjectApiKey, ProjectDataInfo, TableRowConfig } from '../types/index.js';
 
 const api = axios.create({ baseURL: '/api/v1' });
 
@@ -177,12 +177,41 @@ export function projectSqliteUrl(jobId: string): string {
   return `/api/v1/export/project/${jobId}/sqlite`;
 }
 
+export function projectSavedDataZipUrl(projectId: string, format: 'csv' | 'json' | 'sql'): string {
+  return `/api/v1/projects/${projectId}/export/zip?format=${format}`;
+}
+
+export function projectSavedDataSqliteUrl(projectId: string): string {
+  return `/api/v1/projects/${projectId}/export/sqlite`;
+}
+
 export async function queryProjectData(
   jobId: string,
   sql: string,
 ): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
   const { data } = await api.post<{ ok: true; data: { rows: Record<string, unknown>[]; columns: string[] } }>(
     `/query/project/${jobId}`,
+    { sql },
+  );
+  return data.data;
+}
+
+export async function saveProjectData(projectId: string, jobId: string): Promise<{ savedAt: string }> {
+  const { data } = await api.post<{ ok: true; data: { savedAt: string } }>(`/projects/${projectId}/save-data`, { jobId });
+  return data.data;
+}
+
+export async function getProjectDataInfo(projectId: string): Promise<ProjectDataInfo> {
+  const { data } = await api.get<{ ok: true; data: ProjectDataInfo }>(`/projects/${projectId}/data-info`);
+  return data.data;
+}
+
+export async function queryProjectSavedData(
+  projectId: string,
+  sql: string,
+): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
+  const { data } = await api.post<{ ok: true; data: { rows: Record<string, unknown>[]; columns: string[] } }>(
+    `/projects/${projectId}/query-saved`,
     { sql },
   );
   return data.data;
