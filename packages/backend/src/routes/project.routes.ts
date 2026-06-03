@@ -705,7 +705,7 @@ export async function projectRoutes(app: FastifyInstance) {
 
       const dbPath = path.join(dataDir, 'project-data', `${projectId}.db`);
       if (!fs.existsSync(dbPath)) {
-        return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
+        return reply.send({ ok: true, data: { rows: [], columns: [] } });
       }
 
       const limitedSql = /\blimit\b/i.test(trimmed) ? trimmed : `${trimmed} LIMIT 1001`;

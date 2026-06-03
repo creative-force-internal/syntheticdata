@@ -36,16 +36,14 @@ export function QueryPanel() {
   }
 
   async function handleRun() {
-    if (!sql.trim()) return;
-    if (!hasSavedData && !jobId) return;
-    if (hasSavedData && !project) return;
+    if (!sql.trim() || !project?.id) return;
     setRunning(true);
     setError(null);
     setResult(null);
     try {
-      const res = hasSavedData
-        ? await queryProjectSavedData(project!.id, sql.trim())
-        : await queryProjectData(jobId!, sql.trim());
+      const res = jobId && !hasSavedData
+        ? await queryProjectData(jobId, sql.trim())
+        : await queryProjectSavedData(project.id, sql.trim());
       setResult(res);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error
@@ -63,8 +61,7 @@ export function QueryPanel() {
     }
   }
 
-  const canQuery = hasSavedData || !!jobId;
-  // Keep noJob for the download link (still job-based)
+  const canQuery = !!project;
   const noJob = !jobId;
 
   return (
@@ -105,7 +102,7 @@ export function QueryPanel() {
             <textarea
               ref={textareaRef}
               className="w-full h-28 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary resize-none"
-              placeholder={!canQuery ? 'Generate data and click "Save to DB" to enable querying.' : 'SELECT * FROM "users" LIMIT 100;\n\n(Ctrl+Enter to run)'}
+              placeholder='SELECT * FROM "users" LIMIT 100;\n\n(Ctrl+Enter to run)'
               disabled={!canQuery}
               value={sql}
               onChange={e => setSql(e.target.value)}
@@ -177,7 +174,7 @@ export function QueryPanel() {
             {!result && !error && !running && (
               <div className="flex flex-col items-center justify-center h-40 text-muted-foreground gap-2">
                 <Database className="w-8 h-8 opacity-30" />
-                <p className="text-xs">{!canQuery ? 'Generate data then click "Save to DB" in the Generate tab.' : 'Write a query above and press Run.'}</p>
+                <p className="text-xs">Write a query above and press Run.</p>
               </div>
             )}
           </div>

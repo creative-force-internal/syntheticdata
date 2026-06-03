@@ -59,11 +59,63 @@ jobs:
             --image-ids imageTag=${{ github.sha }} \
             --output text > /dev/null
 
+      - name: Ensure ECS Exec task role permissions
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          aws iam put-role-policy \
+            --role-name ecsTaskRole \
+            --policy-name ECSExecPolicy \
+            --policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                  "ssmmessages:CreateControlChannel",
+                  "ssmmessages:CreateDataChannel",
+                  "ssmmessages:OpenControlChannel",
+                  "ssmmessages:OpenDataChannel"
+                ],
+                "Resource": "*"
+              }]
+            }'
+
+      - name: Ensure EBS data volume
+        env:
+          ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
+        run: |
+          # Find existing volume by tag
+          VOLUME_ID=$(aws ec2 describe-volumes \
+            --filters \
+              "Name=tag:Service,Values=$SERVICE_NAME" \
+              "Name=tag:Environment,Values=demo" \
+            --query 'Volumes[0].VolumeId' \
+            --output text)
+          if [ "$VOLUME_ID" = "None" ] || [ -z "$VOLUME_ID" ]; then
+            FIRST_SUBNET=$(echo $ECS_SUBNET_IDS | cut -d',' -f1)
+            AZ=$(aws ec2 describe-subnets \
+              --subnet-ids $FIRST_SUBNET \
+              --query 'Subnets[0].AvailabilityZone' \
+              --output text)
+            VOLUME_ID=$(aws ec2 create-volume \
+              --volume-type gp3 \
+              --size 20 \
+              --availability-zone "$AZ" \
+              --encrypted \
+              --tag-specifications "ResourceType=volume,Tags=[{Key=Service,Value=$SERVICE_NAME},{Key=Environment,Value=demo},{Key=Project,Value=$SERVICE_NAME}]" \
+              --query 'VolumeId' \
+              --output text)
+            echo "Created EBS volume: $VOLUME_ID in $AZ"
+          else
+            echo "Reusing EBS volume: $VOLUME_ID"
+          fi
+          echo "VOLUME_ID=$VOLUME_ID" >> $GITHUB_ENV
+
       - name: Deploy to ECS
         env:
           IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
           ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
           ECS_SECURITY_GROUP_ID: ${{ secrets.ECS_SECURITY_GROUP_ID }}
+          ECS_EBS_ROLE_ARN: ${{ secrets.ECS_EBS_ROLE_ARN }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           cp ecs-task-def.json /tmp/task-def.json
@@ -74,6 +126,8 @@ jobs:
             --cli-input-json file:///tmp/task-def.json \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
+          # EBS volume config — filesystemType only formats if no existing fs found
+          VOLUME_CONFIG="[{\"name\":\"data\",\"managedEBSVolume\":{\"volumeId\":\"$VOLUME_ID\",\"roleArn\":\"$ECS_EBS_ROLE_ARN\",\"encrypted\":true,\"filesystemType\":\"ext4\",\"terminationPolicy\":{\"deleteOnTermination\":false}}}]"
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster $ECS_CLUSTER \
             --services $SERVICE_NAME \
@@ -84,6 +138,9 @@ jobs:
               --cluster $ECS_CLUSTER \
               --service $SERVICE_NAME \
               --task-definition $TASK_DEF_ARN \
+              --enable-execute-command \
+              --volume-configurations "$VOLUME_CONFIG" \
+              --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --force-new-deployment
           else
             aws ecs create-service \
@@ -92,6 +149,9 @@ jobs:
               --task-definition $TASK_DEF_ARN \
               --desired-count 1 \
               --launch-type FARGATE \
+              --enable-execute-command \
+              --volume-configurations "$VOLUME_CONFIG" \
+              --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET_IDS],securityGroups=[$ECS_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
               --tags key=Environment,value=demo key=TTL,value=72h key=Owner,value=$GITHUB_ACTOR key=Project,value=$SERVICE_NAME
           fi
