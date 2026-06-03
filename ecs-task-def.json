@@ -30,6 +30,18 @@
         {
           "name": "DB_PATH",
           "value": "/data/synthetic.db"
+        },
+        {
+          "name": "HOST",
+          "value": "0.0.0.0"
+        },
+        {
+          "name": "PORT",
+          "value": "3000"
+        },
+        {
+          "name": "FRONTEND_DIST",
+          "value": "/app/packages/frontend/dist"
         }
       ],
       "mountPoints": [
