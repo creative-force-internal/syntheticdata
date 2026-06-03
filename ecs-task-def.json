@@ -11,7 +11,14 @@
   "volumes": [
     {
       "name": "data",
-      "configuredAtLaunch": true
+      "efsVolumeConfiguration": {
+        "fileSystemId": "<EFS_ID>",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "<EFS_AP_ID>",
+          "iam": "ENABLED"
+        }
+      }
     }
   ],
   "containerDefinitions": [

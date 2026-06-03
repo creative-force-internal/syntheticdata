@@ -59,9 +59,8 @@ jobs:
             --image-ids imageTag=${{ github.sha }} \
             --output text > /dev/null
 
-      - name: Ensure ECS Exec task role permissions
+      - name: Ensure task role permissions (ECS Exec + EFS)
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           aws iam put-role-policy \
             --role-name ecsTaskRole \
             --policy-name ECSExecPolicy \
@@ -78,68 +77,115 @@ jobs:
                 "Resource": "*"
               }]
             }'
+          aws iam put-role-policy \
+            --role-name ecsTaskRole \
+            --policy-name EFSAccessPolicy \
+            --policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                  "elasticfilesystem:ClientMount",
+                  "elasticfilesystem:ClientWrite"
+                ],
+                "Resource": "*"
+              }]
+            }'
 
-      - name: Ensure EBS data volume
+      - name: Ensure EFS persistent filesystem
         env:
           ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
+          ECS_SECURITY_GROUP_ID: ${{ secrets.ECS_SECURITY_GROUP_ID }}
         run: |
-          # Find existing volume by tag
-          VOLUME_ID=$(aws ec2 describe-volumes \
-            --filters \
-              "Name=tag:Service,Values=$SERVICE_NAME" \
-              "Name=tag:Environment,Values=demo" \
-            --query 'Volumes[0].VolumeId' \
+          # Filesystem — creation-token is the idempotency key (returns existing FS on rerun)
+          EFS_ID=$(aws efs create-file-system \
+            --creation-token "${SERVICE_NAME}-data" \
+            --encrypted \
+            --performance-mode generalPurpose \
+            --throughput-mode bursting \
+            --tags Key=Name,Value=${SERVICE_NAME}-data Key=Environment,Value=demo Key=Project,Value=$SERVICE_NAME \
+            --query 'FileSystemId' --output text)
+          echo "EFS filesystem: $EFS_ID"
+          # Wait until available
+          until [ "$(aws efs describe-file-systems --file-system-id $EFS_ID \
+            --query 'FileSystems[0].LifeCycleState' --output text)" = "available" ]; do
+            echo "waiting for EFS available..."; sleep 5
+          done
+
+          # NFS ingress (2049) on the task SG from itself — mount targets share this SG
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$ECS_SECURITY_GROUP_ID" \
+            --protocol tcp --port 2049 \
+            --source-group "$ECS_SECURITY_GROUP_ID" 2>/dev/null \
+            && echo "Added NFS 2049 ingress" || echo "NFS 2049 ingress already present"
+
+          # One mount target per AZ (per subnet). Skip subnets whose AZ already has one.
+          COVERED_AZS=$(aws efs describe-mount-targets --file-system-id $EFS_ID \
+            --query 'MountTargets[].AvailabilityZoneName' --output text)
+          for SUBNET in $(echo $ECS_SUBNET_IDS | tr ',' ' '); do
+            SUBNET_AZ=$(aws ec2 describe-subnets --subnet-ids $SUBNET \
+              --query 'Subnets[0].AvailabilityZone' --output text)
+            if echo "$COVERED_AZS" | grep -qw "$SUBNET_AZ"; then
+              echo "Mount target already in $SUBNET_AZ, skip"
+            else
+              aws efs create-mount-target \
+                --file-system-id $EFS_ID \
+                --subnet-id $SUBNET \
+                --security-groups "$ECS_SECURITY_GROUP_ID" \
+                --query 'MountTargetId' --output text
+              COVERED_AZS="$COVERED_AZS $SUBNET_AZ"
+              echo "Created mount target in $SUBNET_AZ"
+            fi
+          done
+
+          # Access point — enforces posixUser 1000:1000 + root dir regardless of container user
+          EFS_AP_ID=$(aws efs describe-access-points --file-system-id $EFS_ID \
+            --query "AccessPoints[?Tags[?Key=='Name'&&Value=='${SERVICE_NAME}-data']].AccessPointId | [0]" \
             --output text)
-          if [ "$VOLUME_ID" = "None" ] || [ -z "$VOLUME_ID" ]; then
-            FIRST_SUBNET=$(echo $ECS_SUBNET_IDS | cut -d',' -f1)
-            AZ=$(aws ec2 describe-subnets \
-              --subnet-ids $FIRST_SUBNET \
-              --query 'Subnets[0].AvailabilityZone' \
-              --output text)
-            VOLUME_ID=$(aws ec2 create-volume \
-              --volume-type gp3 \
-              --size 20 \
-              --availability-zone "$AZ" \
-              --encrypted \
-              --tag-specifications "ResourceType=volume,Tags=[{Key=Service,Value=$SERVICE_NAME},{Key=Environment,Value=demo},{Key=Project,Value=$SERVICE_NAME}]" \
-              --query 'VolumeId' \
-              --output text)
-            echo "Created EBS volume: $VOLUME_ID in $AZ"
+          if [ "$EFS_AP_ID" = "None" ] || [ -z "$EFS_AP_ID" ]; then
+            EFS_AP_ID=$(aws efs create-access-point \
+              --file-system-id $EFS_ID \
+              --tags Key=Name,Value=${SERVICE_NAME}-data \
+              --posix-user "Uid=1000,Gid=1000" \
+              --root-directory "Path=/synthetic,CreationInfo={OwnerUid=1000,OwnerGid=1000,Permissions=0755}" \
+              --query 'AccessPointId' --output text)
+            echo "Created access point: $EFS_AP_ID"
           else
-            echo "Reusing EBS volume: $VOLUME_ID"
+            echo "Reusing access point: $EFS_AP_ID"
           fi
-          echo "VOLUME_ID=$VOLUME_ID" >> $GITHUB_ENV
+
+          echo "EFS_ID=$EFS_ID" >> $GITHUB_ENV
+          echo "EFS_AP_ID=$EFS_AP_ID" >> $GITHUB_ENV
 
       - name: Deploy to ECS
         env:
           IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
           ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
           ECS_SECURITY_GROUP_ID: ${{ secrets.ECS_SECURITY_GROUP_ID }}
-          ECS_EBS_ROLE_ARN: ${{ secrets.ECS_EBS_ROLE_ARN }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           cp ecs-task-def.json /tmp/task-def.json
           sed -i "s|<ECR_IMAGE_URL>|$IMAGE|g" /tmp/task-def.json
           sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g" /tmp/task-def.json
           sed -i "s|<AWS_REGION>|$AWS_REGION|g" /tmp/task-def.json
+          sed -i "s|<EFS_ID>|$EFS_ID|g" /tmp/task-def.json
+          sed -i "s|<EFS_AP_ID>|$EFS_AP_ID|g" /tmp/task-def.json
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file:///tmp/task-def.json \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)
-          # EBS volume config — filesystemType only formats if no existing fs found
-          VOLUME_CONFIG="[{\"name\":\"data\",\"managedEBSVolume\":{\"volumeId\":\"$VOLUME_ID\",\"roleArn\":\"$ECS_EBS_ROLE_ARN\",\"encrypted\":true,\"filesystemType\":\"ext4\",\"terminationPolicy\":{\"deleteOnTermination\":false}}}]"
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster $ECS_CLUSTER \
             --services $SERVICE_NAME \
             --query 'services[0].status' \
             --output text || echo "MISSING")
           if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            # min 0% / max 100% → old task stops before new starts (single SQLite writer)
             aws ecs update-service \
               --cluster $ECS_CLUSTER \
               --service $SERVICE_NAME \
               --task-definition $TASK_DEF_ARN \
               --enable-execute-command \
-              --volume-configurations "$VOLUME_CONFIG" \
               --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --force-new-deployment
           else
@@ -150,7 +196,6 @@ jobs:
               --desired-count 1 \
               --launch-type FARGATE \
               --enable-execute-command \
-              --volume-configurations "$VOLUME_CONFIG" \
               --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET_IDS],securityGroups=[$ECS_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
               --tags key=Environment,value=demo key=TTL,value=72h key=Owner,value=$GITHUB_ACTOR key=Project,value=$SERVICE_NAME
