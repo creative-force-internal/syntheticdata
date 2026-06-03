@@ -186,6 +186,7 @@ jobs:
               --service $SERVICE_NAME \
               --task-definition $TASK_DEF_ARN \
               --enable-execute-command \
+              --availability-zone-rebalancing DISABLED \
               --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --force-new-deployment
           else
@@ -196,6 +197,7 @@ jobs:
               --desired-count 1 \
               --launch-type FARGATE \
               --enable-execute-command \
+              --availability-zone-rebalancing DISABLED \
               --deployment-configuration "minimumHealthyPercent=0,maximumPercent=100" \
               --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET_IDS],securityGroups=[$ECS_SECURITY_GROUP_ID],assignPublicIp=DISABLED}" \
               --tags key=Environment,value=demo key=TTL,value=72h key=Owner,value=$GITHUB_ACTOR key=Project,value=$SERVICE_NAME
