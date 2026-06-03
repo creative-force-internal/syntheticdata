@@ -97,15 +97,22 @@ jobs:
           ECS_SUBNET_IDS: ${{ secrets.ECS_SUBNET_IDS }}
           ECS_SECURITY_GROUP_ID: ${{ secrets.ECS_SECURITY_GROUP_ID }}
         run: |
-          # Filesystem — creation-token is the idempotency key (returns existing FS on rerun)
-          EFS_ID=$(aws efs create-file-system \
+          # Filesystem — look up by creation-token, create only if absent
+          EFS_ID=$(aws efs describe-file-systems \
             --creation-token "${SERVICE_NAME}-data" \
-            --encrypted \
-            --performance-mode generalPurpose \
-            --throughput-mode bursting \
-            --tags Key=Name,Value=${SERVICE_NAME}-data Key=Environment,Value=demo Key=Project,Value=$SERVICE_NAME \
-            --query 'FileSystemId' --output text)
-          echo "EFS filesystem: $EFS_ID"
+            --query 'FileSystems[0].FileSystemId' --output text 2>/dev/null || echo "None")
+          if [ "$EFS_ID" = "None" ] || [ -z "$EFS_ID" ]; then
+            EFS_ID=$(aws efs create-file-system \
+              --creation-token "${SERVICE_NAME}-data" \
+              --encrypted \
+              --performance-mode generalPurpose \
+              --throughput-mode bursting \
+              --tags Key=Name,Value=${SERVICE_NAME}-data Key=Environment,Value=demo Key=Project,Value=$SERVICE_NAME \
+              --query 'FileSystemId' --output text)
+            echo "Created EFS filesystem: $EFS_ID"
+          else
+            echo "Reusing EFS filesystem: $EFS_ID"
+          fi
           # Wait until available
           until [ "$(aws efs describe-file-systems --file-system-id $EFS_ID \
             --query 'FileSystems[0].LifeCycleState' --output text)" = "available" ]; do
