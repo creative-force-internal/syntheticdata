@@ -128,7 +128,7 @@ For multi-table projects, tables are sorted by FK dependencies before generation
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **syntheticdata** (2287 symbols, 3728 relationships, 139 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **syntheticdata** (2324 symbols, 3769 relationships, 140 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

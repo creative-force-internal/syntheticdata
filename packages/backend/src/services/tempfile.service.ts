@@ -5,12 +5,12 @@
  */
 
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 import readline from 'readline';
 import type { GeneratedRow } from '../types/index.js';
+import { dataDir } from '../db/database.js';
 
-const TEMP_DIR = path.join(os.tmpdir(), 'synthetic-jobs');
+const TEMP_DIR = path.join(dataDir, 'synthetic-jobs');
 
 export function getTempDir(): string {
   if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
