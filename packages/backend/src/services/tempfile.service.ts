@@ -8,9 +8,15 @@ import path from 'path';
 import fs from 'fs';
 import readline from 'readline';
 import type { GeneratedRow } from '../types/index.js';
-import { dataDir } from '../db/database.js';
 
-const TEMP_DIR = path.join(dataDir, 'synthetic-jobs');
+// Mirror database.ts dbPath resolution so temp files live next to the DB.
+// Resolved lazily to avoid a circular import with db/database.ts.
+function resolveTempDir(): string {
+  const dbPath = process.env.DB_PATH ?? path.join(process.cwd(), 'data', 'synthetic.db');
+  return path.join(path.dirname(dbPath), 'synthetic-jobs');
+}
+
+const TEMP_DIR = resolveTempDir();
 
 export function getTempDir(): string {
   if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
