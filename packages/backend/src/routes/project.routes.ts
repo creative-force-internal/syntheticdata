@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { projectStore, jobStore, groupStore } from '../store/session.store.js';
-import { dataDir } from '../db/database.js';
+import { projectDbPath, ensureProjectDataDir } from '../db/database.js';
 import { parsePrismaSchema } from '../services/prisma-parser.service.js';
 import { parseSQLMultiple } from '../services/sql-parser.service.js';
 import { inferFkCandidates } from '../services/fk-inference.service.js';
@@ -170,10 +170,10 @@ export async function projectRoutes(app: FastifyInstance) {
     };
     projectStore.set(updated);
 
-    const projectDbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
-    if (fs.existsSync(projectDbPath)) {
+    const dbPath = projectDbPath(req.params.id);
+    if (fs.existsSync(dbPath)) {
       try {
-        updateSqliteSchema(updated.tables, projectDbPath);
+        updateSqliteSchema(updated.tables, dbPath);
       } catch (e) {
         app.log.warn({ err: e, projectId: req.params.id }, 'Failed to update project DB schema');
       }
@@ -510,9 +510,8 @@ export async function projectRoutes(app: FastifyInstance) {
       if (job.projectId !== req.params.id) return reply.code(400).send({ ok: false, error: 'Job does not belong to this project' });
       if (!job.resultPaths) return reply.code(400).send({ ok: false, error: 'No result data in job' });
 
-      const projectDataDir = path.join(dataDir, 'project-data');
-      await fs.promises.mkdir(projectDataDir, { recursive: true });
-      const dbPath = path.join(projectDataDir, `${req.params.id}.db`);
+      ensureProjectDataDir();
+      const dbPath = projectDbPath(req.params.id);
 
       await buildSqliteDb(project.tables, job.resultPaths, dbPath);
 
@@ -527,7 +526,7 @@ export async function projectRoutes(app: FastifyInstance) {
     async (req, reply) => {
       if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
 
-      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+      const dbPath = projectDbPath(req.params.id);
 
       if (!fs.existsSync(dbPath)) {
         return reply.send({ ok: true, data: { hasSavedData: false } });
@@ -557,7 +556,7 @@ export async function projectRoutes(app: FastifyInstance) {
       const project = getProject(req.params.id, reply);
       if (!project) return;
 
-      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+      const dbPath = projectDbPath(req.params.id);
       if (!fs.existsSync(dbPath)) {
         return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
       }
@@ -593,7 +592,7 @@ export async function projectRoutes(app: FastifyInstance) {
       const project = getProject(req.params.id, reply);
       if (!project) return;
 
-      const dbPath = path.join(dataDir, 'project-data', `${req.params.id}.db`);
+      const dbPath = projectDbPath(req.params.id);
       if (!fs.existsSync(dbPath)) {
         return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
       }
@@ -703,7 +702,7 @@ export async function projectRoutes(app: FastifyInstance) {
         return reply.code(400).send({ ok: false, error: 'Only read-only queries are allowed' });
       }
 
-      const dbPath = path.join(dataDir, 'project-data', `${projectId}.db`);
+      const dbPath = projectDbPath(projectId);
       if (!fs.existsSync(dbPath)) {
         return reply.send({ ok: true, data: { rows: [], columns: [] } });
       }

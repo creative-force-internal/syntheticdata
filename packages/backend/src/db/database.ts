@@ -15,6 +15,19 @@ if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
 export const dataDir = dbDir;
 
+// Per-project persistent SQLite data file. Single source of truth shared by
+// the UI (save-data / query-saved / export) and the D1-compat API.
+export function projectDbPath(projectId: string): string {
+  return path.join(dataDir, 'project-data', `${projectId}.db`);
+}
+
+// Ensure the project-data directory exists before writing a project DB.
+export function ensureProjectDataDir(): string {
+  const dir = path.join(dataDir, 'project-data');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');

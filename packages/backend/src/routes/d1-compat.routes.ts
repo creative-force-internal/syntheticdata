@@ -26,13 +26,11 @@
 import type { FastifyInstance } from 'fastify';
 import BetterSqlite3 from 'better-sqlite3';
 import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
 import { nanoid } from 'nanoid';
-import { db as mainDb } from '../db/database.js';
+import { db as mainDb, projectDbPath, ensureProjectDataDir } from '../db/database.js';
 import { projectStore } from '../store/session.store.js';
 import { buildSqliteDb } from '../services/sqlite-export.service.js';
-import { getTempDir } from '../services/tempfile.service.js';
 import type { GenerationJob, ProjectApiKey } from '../types/index.js';
 
 // ─── Security ─────────────────────────────────────────────────────────────────
@@ -55,13 +53,25 @@ function generateApiKey(): { key: string; prefix: string; hash: string } {
   return { key, prefix, hash: hashKey(key) };
 }
 
-// ─── D1 DB cache with build lock ─────────────────────────────────────────────
+// ─── D1 DB resolution with build lock ────────────────────────────────────────
 
-const d1Cache = new Map<string, { dbPath: string; jobId: string }>();
-// Coalesces concurrent cold-cache requests — only one rebuild runs per project.
+// Coalesces concurrent cold-cache requests — only one build runs per project.
 const d1Building = new Map<string, Promise<void>>();
 
+/**
+ * Resolve the project's persistent SQLite data file — the same DB the UI reads
+ * and writes (save-data / query-saved / export). This is the single source of
+ * truth, so D1 writes via /execute persist and are visible in the UI.
+ *
+ * If the file already exists it is used as-is (the UI owns its lifecycle).
+ * As a fallback, when no saved DB exists yet, build one from the latest
+ * completed job so the API works immediately after generation without an
+ * explicit UI save.
+ */
 async function resolveD1Db(projectId: string): Promise<string | null> {
+  const dbPath = projectDbPath(projectId);
+  if (fs.existsSync(dbPath)) return dbPath;
+
   type JobRow = { id: string; data: string };
   const row = mainDb.prepare(`
     SELECT id, data FROM jobs
@@ -76,21 +86,16 @@ async function resolveD1Db(projectId: string): Promise<string | null> {
   const job = JSON.parse(row.data) as GenerationJob;
   if (!job.resultPaths) return null;
 
-  const dbPath = path.join(getTempDir(), `d1_${projectId}.db`);
-  const cached = d1Cache.get(projectId);
-
-  if (!cached || cached.jobId !== row.id || !fs.existsSync(dbPath)) {
-    let build = d1Building.get(projectId);
-    if (!build) {
-      const project = projectStore.get(projectId);
-      if (!project) return null;
-      build = buildSqliteDb(project.tables, job.resultPaths, dbPath)
-        .then(() => { d1Cache.set(projectId, { dbPath, jobId: row.id }); })
-        .finally(() => { d1Building.delete(projectId); });
-      d1Building.set(projectId, build);
-    }
-    await build;
+  let build = d1Building.get(projectId);
+  if (!build) {
+    const project = projectStore.get(projectId);
+    if (!project) return null;
+    ensureProjectDataDir();
+    build = buildSqliteDb(project.tables, job.resultPaths, dbPath)
+      .finally(() => { d1Building.delete(projectId); });
+    d1Building.set(projectId, build);
   }
+  await build;
 
   return dbPath;
 }
