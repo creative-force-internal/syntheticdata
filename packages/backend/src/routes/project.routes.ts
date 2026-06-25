@@ -452,14 +452,17 @@ export async function projectRoutes(app: FastifyInstance) {
       const project = projectStore.get(job.projectId);
       if (!project) return reply.code(404).send({ ok: false, error: 'Project not found' });
 
-      const format = (req.query.format ?? 'csv') as 'csv' | 'json' | 'sql';
+      const format = (['csv', 'json', 'sql'].includes(req.query.format ?? '')
+        ? req.query.format
+        : 'csv') as 'csv' | 'json' | 'sql';
 
       const { buildZip } = await import('../services/zip-export.service.js');
       const zipStream = buildZip(project.tables, job.resultPaths, format);
 
+      const safeName = project.name.replace(/[^a-zA-Z0-9_-]/g, '_');
       reply
         .header('Content-Type', 'application/zip')
-        .header('Content-Disposition', `attachment; filename="${project.name.replace(/\s+/g, '_')}_synthetic.zip"`);
+        .header('Content-Disposition', `attachment; filename="${safeName}_synthetic.zip"`);
 
       return reply.send(zipStream);
     },
@@ -572,7 +575,7 @@ export async function projectRoutes(app: FastifyInstance) {
       pdb.close();
 
       const zipStream = buildZipFromDb(dbPath, tableNames, format);
-      const safeProjName = project.name.replace(/\s+/g, '_');
+      const safeProjName = project.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
       reply
         .header('Content-Type', 'application/zip')

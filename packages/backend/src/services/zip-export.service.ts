@@ -31,9 +31,15 @@ function tableStream(filePath: string, tableName: string, format: ZipFormat): Re
  */
 // ─── Helpers for SQLite → text formats ───────────────────────────────────────
 
+// Leading chars Excel/Sheets interpret as a formula — neutralize to block
+// CSV formula injection (a cell like `=cmd()` executing on open).
+const FORMULA_LEAD_RE = /^[=+\-@\t\r]/;
+
 function csvField(val: unknown): string {
-  const s = val === null || val === undefined ? '' : String(val);
-  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+  let s = val === null || val === undefined ? '' : String(val);
+  const formula = FORMULA_LEAD_RE.test(s);
+  if (formula) s = `'${s}`;
+  if (formula || s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
     return `"${s.replace(/"/g, '""')}"`;
   }
   return s;
@@ -46,40 +52,53 @@ function sqlVal(val: unknown): string {
   return `'${String(val).replace(/'/g, "''")}'`;
 }
 
+const sqlIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
 function sqliteTableToStream(db: Database.Database, tableName: string, format: ZipFormat): Readable {
   const pass = new PassThrough();
-  setImmediate(() => {
+  const safeTable = sqlIdent(tableName);
+  const iter = db.prepare(`SELECT * FROM ${safeTable}`).iterate() as IterableIterator<Record<string, unknown>>;
+  let first = true;
+  let columns: string[] = [];
+
+  // Synchronous iteration would buffer the whole table in `pass`; pump with
+  // backpressure instead — pause on a full buffer, resume on `drain`.
+  function pump() {
     try {
-      const safeTable = tableName.replace(/"/g, '""');
-      const iter = db.prepare(`SELECT * FROM "${safeTable}"`).iterate() as IterableIterator<Record<string, unknown>>;
-      let first = true;
-      let columns: string[] = [];
-
-      if (format === 'json') pass.write('[');
-
-      for (const row of iter) {
+      let next: IteratorResult<Record<string, unknown>>;
+      while (!(next = iter.next()).done) {
+        const row = next.value;
+        let chunk: string;
         if (first) {
           columns = Object.keys(row);
-          if (format === 'csv') pass.write(columns.map(csvField).join(',') + '\n');
-        }
-        if (format === 'csv') {
-          pass.write(columns.map(c => csvField(row[c])).join(',') + '\n');
-        } else if (format === 'json') {
-          pass.write((first ? '' : ',\n') + JSON.stringify(row));
+          if (format === 'csv') chunk = columns.map(csvField).join(',') + '\n';
+          else if (format === 'json') chunk = '[';
+          else chunk = '';
         } else {
-          const colList = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
+          chunk = '';
+        }
+
+        if (format === 'csv') {
+          chunk += columns.map(c => csvField(row[c])).join(',') + '\n';
+        } else if (format === 'json') {
+          chunk += (first ? '' : ',\n') + JSON.stringify(row);
+        } else {
+          const colList = columns.map(sqlIdent).join(', ');
           const vals = columns.map(c => sqlVal(row[c])).join(', ');
-          pass.write(`INSERT INTO "${safeTable}" (${colList}) VALUES (${vals});\n`);
+          chunk += `INSERT INTO ${safeTable} (${colList}) VALUES (${vals});\n`;
         }
         first = false;
-      }
 
-      if (format === 'json') pass.write(']');
+        if (!pass.write(chunk)) { pass.once('drain', pump); return; }
+      }
+      if (format === 'json') pass.write(first ? '[]' : ']');
       pass.end();
     } catch (e) {
       pass.destroy(e as Error);
     }
-  });
+  }
+
+  setImmediate(pump);
   return pass;
 }
 
@@ -117,6 +136,10 @@ export function buildZip(
 ): archiver.Archiver {
   const tableById = new Map(tables.map(t => [t.id, t]));
   const archive = archiver('zip', { zlib: { level: 6 } });
+  // Without a listener an archiver 'error' is thrown as an unhandled exception
+  // if it fires before Fastify attaches its own. Nothing to clean up here (no
+  // DB handle, unlike buildZipFromDb); the error surfaces on the piped response.
+  archive.on('error', () => { /* handled by the piped Fastify response */ });
 
   for (const [tableId, filePath] of Object.entries(resultPaths)) {
     const table = tableById.get(tableId);

@@ -13,10 +13,16 @@ import type { GeneratedRow } from '../types/index.js';
 
 // ─── CSV line formatter ───────────────────────────────────────────────────────
 
+// Leading chars Excel/Sheets interpret as a formula — neutralize to block
+// CSV formula injection (a cell like `=cmd()` executing on open).
+const FORMULA_LEAD_RE = /^[=+\-@\t\r]/;
+
 function csvCell(v: unknown): string {
   if (v === null || v === undefined) return '';
-  const s = String(v);
-  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+  let s = String(v);
+  const formula = FORMULA_LEAD_RE.test(s);
+  if (formula) s = `'${s}`; // prefix apostrophe defuses the formula
+  if (formula || s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
     return `"${s.replace(/"/g, '""')}"`;
   }
   return s;
@@ -26,7 +32,44 @@ function toCsvLine(values: unknown[]): string {
   return values.map(csvCell).join(',');
 }
 
+// Quote a SQL identifier, doubling embedded double-quotes.
+function sqlIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
 // ─── Stream helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Drive a JSONL file through a per-row callback into a PassThrough with proper
+ * backpressure: when the writable buffer fills, pause the line reader and
+ * resume on `drain`. Keeps memory bounded regardless of dataset size.
+ * Malformed lines abort the stream instead of throwing inside the emitter.
+ */
+function streamJsonl(
+  filePath: string,
+  out: PassThrough,
+  onRow: (row: GeneratedRow, write: (chunk: string) => void) => void,
+  onEnd?: (write: (chunk: string) => void) => void,
+): void {
+  const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
+  const write = (chunk: string) => { if (!out.write(chunk)) rl.pause(); };
+  out.on('drain', () => rl.resume());
+
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    let row: GeneratedRow;
+    try {
+      row = JSON.parse(line) as GeneratedRow;
+    } catch (e) {
+      rl.close();
+      out.destroy(e as Error);
+      return;
+    }
+    onRow(row, write);
+  });
+  rl.on('close', () => { onEnd?.(write); out.end(); });
+  rl.on('error', err => out.destroy(err));
+}
 
 /** Stream a JSONL file as CSV rows via a PassThrough. */
 function jsonlToCsvStream(filePath: string, includeHeader: boolean): PassThrough {
@@ -34,40 +77,33 @@ function jsonlToCsvStream(filePath: string, includeHeader: boolean): PassThrough
   if (!fs.existsSync(filePath)) { out.end(); return out; }
 
   let columns: string[] | null = null;
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
-
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
-    const row = JSON.parse(line) as GeneratedRow;
+  streamJsonl(filePath, out, (row, write) => {
     if (columns === null) {
       columns = Object.keys(row);
-      if (includeHeader) out.push(toCsvLine(columns) + '\r\n');
+      if (includeHeader) write(toCsvLine(columns) + '\r\n');
     }
-    out.push(toCsvLine(columns.map(c => row[c])) + '\r\n');
+    write(toCsvLine(columns.map(c => row[c])) + '\r\n');
   });
-  rl.on('close', () => out.push(null));
-  rl.on('error', err => out.destroy(err));
   return out;
 }
 
 /** Stream a JSONL file as a JSON array (`[\n...\n]`). */
 function jsonlToJsonStream(filePath: string, pretty: boolean): PassThrough {
   const out = new PassThrough();
-  if (!fs.existsSync(filePath)) { out.push('[]'); out.end(); return out; }
+  if (!fs.existsSync(filePath)) { out.write('[]'); out.end(); return out; }
 
   let first = true;
-  out.push('[\n');
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
-
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
-    const sep = first ? '' : ',\n';
-    first = false;
-    const row = JSON.parse(line);
-    out.push(sep + (pretty ? JSON.stringify(row, null, 2) : JSON.stringify(row)));
-  });
-  rl.on('close', () => { out.push('\n]'); out.push(null); });
-  rl.on('error', err => out.destroy(err));
+  out.write('[\n');
+  streamJsonl(
+    filePath,
+    out,
+    (row, write) => {
+      const sep = first ? '' : ',\n';
+      first = false;
+      write(sep + (pretty ? JSON.stringify(row, null, 2) : JSON.stringify(row)));
+    },
+    (write) => write('\n]'),
+  );
   return out;
 }
 
@@ -76,17 +112,10 @@ function jsonlToSqlStream(filePath: string, tableName: string): PassThrough {
   const out = new PassThrough();
   if (!fs.existsSync(filePath)) { out.end(); return out; }
 
+  const safeTable = sqlIdent(tableName);
   const BATCH = 500;
   let columns: string[] | null = null;
   let batch: string[] = [];
-
-  function flushBatch() {
-    if (batch.length === 0 || !columns) return;
-    const cols = columns.map(c => `"${c}"`).join(', ');
-    out.push(`INSERT INTO "${tableName}" (${cols}) VALUES\n`);
-    out.push(batch.join(',\n') + ';\n\n');
-    batch = [];
-  }
 
   function sqlValue(v: unknown): string {
     if (v === null || v === undefined) return 'NULL';
@@ -95,17 +124,24 @@ function jsonlToSqlStream(filePath: string, tableName: string): PassThrough {
     return `'${String(v).replace(/'/g, "''")}'`;
   }
 
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath), crlfDelay: Infinity });
+  function flushBatch(write: (chunk: string) => void) {
+    if (batch.length === 0 || !columns) return;
+    const cols = columns.map(sqlIdent).join(', ');
+    write(`INSERT INTO ${safeTable} (${cols}) VALUES\n`);
+    write(batch.join(',\n') + ';\n\n');
+    batch = [];
+  }
 
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
-    const row = JSON.parse(line) as GeneratedRow;
-    if (columns === null) columns = Object.keys(row);
-    batch.push(`  (${columns.map(c => sqlValue(row[c])).join(', ')})`);
-    if (batch.length >= BATCH) flushBatch();
-  });
-  rl.on('close', () => { flushBatch(); out.push(null); });
-  rl.on('error', err => out.destroy(err));
+  streamJsonl(
+    filePath,
+    out,
+    (row, write) => {
+      if (columns === null) columns = Object.keys(row);
+      batch.push(`  (${columns.map(c => sqlValue(row[c])).join(', ')})`);
+      if (batch.length >= BATCH) flushBatch(write);
+    },
+    (write) => flushBatch(write),
+  );
   return out;
 }
 
