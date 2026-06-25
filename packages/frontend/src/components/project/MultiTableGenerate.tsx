@@ -1,13 +1,11 @@
-import axios from 'axios';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Zap, RefreshCw, ArrowRight, Info, X, StopCircle, FlaskConical, Save, CheckCircle2 } from 'lucide-react';
+import { Zap, RefreshCw, ArrowRight, Info, X, StopCircle, FlaskConical } from 'lucide-react';
 import {
   startProjectGeneration,
   pollProjectJobStatus,
   getProjectPreview,
   cancelProjectJob,
-  saveProjectData,
 } from '../../api/client.js';
 import { useProjectStore } from '../../store/projectStore.js';
 import { estimateChildRowCount, fmtNum } from '../../utils/estimate.js';
@@ -26,7 +24,7 @@ const PRESETS = [
 export function MultiTableGenerate() {
   const navigate = useNavigate();
   const { projectId } = useParams<{ projectId: string }>();
-  const { project, jobId: storeJobId, jobResults, setJobResult, setTableRowCounts } = useProjectStore();
+  const { project, jobResults, setJobResult, setTableRowCounts } = useProjectStore();
   const tables = project?.tables ?? [];
 
   const [tableConfigs, setTableConfigs] = useState<TableConfig[]>([]);
@@ -41,9 +39,6 @@ export function MultiTableGenerate() {
   const [cancelling, setCancelling] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [previewResults, setPreviewResults] = useState<Record<string, unknown[]> | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -80,26 +75,10 @@ export function MultiTableGenerate() {
     ? Math.ceil((totalRows - completedRows) / rowsPerSec)
     : null;
 
-  async function handleSaveDb() {
-    if (!project || !storeJobId) return;
-    setSaving(true);
-    setSaveError(null);
-    setSavedAt(null);
-    try {
-      const { savedAt: ts } = await saveProjectData(project.id, storeJobId);
-      setSavedAt(ts);
-    } catch (e: unknown) {
-      const msg = axios.isAxiosError(e) ? (e.response?.data as { error?: string })?.error ?? e.message : (e as Error).message;
-      setSaveError(msg);
-    } finally {
-      setSaving(false);
-    }
-  }
-
   async function handleGenerate() {
     if (!project) return;
     setRunning(true); setProgress(0); setCompletedRows(0);
-    setError(null); setCancelling(false); setSavedAt(null); setSaveError(null);
+    setError(null); setCancelling(false);
     const total = tableConfigs.reduce((s, c) => s + c.rowCount, 0);
     setTotalRows(total);
     setStartTime(Date.now());
@@ -391,16 +370,6 @@ export function MultiTableGenerate() {
             </button>
           )}
 
-          {isDone && !running && (
-            <button
-              onClick={handleSaveDb}
-              disabled={saving}
-              className="flex items-center gap-2 border border-primary/50 text-primary px-3 py-2 rounded-lg text-xs hover:bg-primary/10 disabled:opacity-50 transition-colors"
-            >
-              {saving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-              {saving ? 'Saving…' : 'Save to DB'}
-            </button>
-          )}
         </div>
 
         {/* Seed info */}
@@ -410,19 +379,6 @@ export function MultiTableGenerate() {
           </p>
         )}
 
-        {savedAt && (
-          <div className="flex items-center gap-2 text-xs text-green-400">
-            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-            Saved to project DB at {new Date(savedAt).toLocaleTimeString()}. Query tab is ready.
-          </div>
-        )}
-
-        {saveError && (
-          <div className="flex items-start gap-2 bg-destructive/10 border border-destructive/30 rounded-lg px-3 py-2 text-xs text-destructive">
-            <X className="w-4 h-4 shrink-0 mt-0.5" />
-            {saveError}
-          </div>
-        )}
       </div>
     </div>
   );

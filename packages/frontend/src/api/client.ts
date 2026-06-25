@@ -103,6 +103,18 @@ export async function updateProject(id: string, name: string, tables: DatasetSch
   return data.data;
 }
 
+export interface ResyncResult {
+  project: Project;
+  addedTables: string[];
+  addedColumns: Record<string, string[]>;
+}
+
+/** Pull actual tables/columns from the saved data db into the project schema (additive). */
+export async function resyncProjectSchema(id: string): Promise<ResyncResult> {
+  const { data } = await api.post<{ ok: true; data: ResyncResult }>(`/projects/${id}/resync-schema`, {});
+  return data.data;
+}
+
 /** Move a project to a different group (or null = Uncategorized). Fetches first to preserve tables. */
 export async function moveProjectToGroup(id: string, groupId: string | null): Promise<Project> {
   const existing = await getProject(id);

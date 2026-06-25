@@ -8,7 +8,8 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import readline from 'readline';
-import type { ColumnDataType, DatasetSchema } from '../types/index.js';
+import { nanoid } from 'nanoid';
+import type { ColumnDataType, ColumnSchema, DatasetSchema } from '../types/index.js';
 
 // ─── SQLite type inference ────────────────────────────────────────────────────
 
@@ -99,6 +100,97 @@ export function updateSqliteSchema(tables: DatasetSchema[], dbPath: string): voi
         }
       }
     }
+  } finally {
+    db.close();
+  }
+}
+
+// ─── Reverse reconcile: data db → schema definition ────────────────────────────
+
+/** SQLite declared column type → app ColumnDataType. */
+function sqliteToDataType(declType: string): ColumnDataType {
+  const t = (declType || '').toUpperCase();
+  if (t.includes('INT')) return 'integer';
+  if (t.includes('REAL') || t.includes('FLOA') || t.includes('DOUB') || t.includes('NUMERIC') || t.includes('DEC'))
+    return 'float';
+  return 'string';
+}
+
+export interface ReconcileResult {
+  tables: DatasetSchema[];
+  addedTables: string[];
+  addedColumns: Record<string, string[]>;
+}
+
+/**
+ * Additively reconcile project table DEFINITIONS against the actual saved
+ * SQLite data db. Adds tables and columns that exist in the db but are missing
+ * from the schema (e.g. after a user builds tables via the query/import flow).
+ *
+ * NEVER drops anything from the schema — design may legitimately be ahead of
+ * the saved data. Existing table/column generator config is preserved untouched;
+ * only brand-new tables/columns are appended with default config.
+ */
+export function reconcileTablesFromDb(tables: DatasetSchema[], dbPath: string): ReconcileResult {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const ts = new Date().toISOString();
+    const dbTableNames = (
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+        .all() as { name: string }[]
+    ).map(r => r.name);
+
+    const byName = new Map(tables.map(t => [t.name, t]));
+    const result: DatasetSchema[] = [...tables];
+    const addedTables: string[] = [];
+    const addedColumns: Record<string, string[]> = {};
+
+    const buildCol = (c: { name: string; type: string; notnull: number; pk: number }): ColumnSchema => {
+      const isPk = c.pk > 0;
+      return {
+        id: nanoid(),
+        name: c.name,
+        dataType: sqliteToDataType(c.type),
+        indexType: isPk ? 'primary_key' : 'none',
+        ...(isPk ? { poolName: c.name } : {}),
+        notNull: c.notnull === 1 || isPk,
+        generatorConfig: {},
+      };
+    };
+
+    for (const tableName of dbTableNames) {
+      const cols = db.prepare(`PRAGMA table_info("${tableName}")`).all() as {
+        name: string;
+        type: string;
+        notnull: number;
+        pk: number;
+      }[];
+
+      const existing = byName.get(tableName);
+      if (!existing) {
+        result.push({
+          id: nanoid(),
+          name: tableName,
+          columns: cols.map(buildCol),
+          rules: [],
+          sourceType: 'sql',
+          createdAt: ts,
+          updatedAt: ts,
+        });
+        addedTables.push(tableName);
+      } else {
+        const have = new Set(existing.columns.map(c => c.name));
+        const fresh = cols.filter(c => !have.has(c.name));
+        if (fresh.length) {
+          existing.columns.push(...fresh.map(buildCol));
+          existing.updatedAt = ts;
+          addedColumns[tableName] = fresh.map(c => c.name);
+        }
+      }
+    }
+
+    return { tables: result, addedTables, addedColumns };
   } finally {
     db.close();
   }

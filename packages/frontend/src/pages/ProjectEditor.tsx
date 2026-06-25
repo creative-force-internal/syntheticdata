@@ -1,8 +1,8 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { ArrowLeft, Save, Loader2 } from 'lucide-react';
+import { ArrowLeft, Save, Loader2, RefreshCw } from 'lucide-react';
 import { nanoid } from 'nanoid';
-import { getProject, updateProject } from '../api/client.js';
+import { getProject, updateProject, resyncProjectSchema } from '../api/client.js';
 import type { DatasetSchema, ProjectTab } from '../types/index.js';
 import { useProjectStore } from '../store/projectStore.js';
 import { useAppStore } from '../store/appStore.js';
@@ -68,6 +68,8 @@ export function ProjectEditor() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [resyncing, setResyncing] = useState(false);
+  const [resyncMsg, setResyncMsg] = useState<string | null>(null);
 
   // Load project when projectId changes
   useEffect(() => {
@@ -120,6 +122,32 @@ export function ProjectEditor() {
       setSaveError((e as Error).message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleResync() {
+    if (!project) return;
+    setResyncing(true);
+    setSaveError(null);
+    setResyncMsg(null);
+    try {
+      const res = await resyncProjectSchema(project.id);
+      setProject(res.project);
+      setProjectName(res.project.name);
+      if (res.project.tables.length > 0 && !activeTableId) {
+        setActiveTableId(res.project.tables[0].id);
+      }
+      const t = res.addedTables.length;
+      const c = Object.keys(res.addedColumns).length;
+      setResyncMsg(
+        t === 0 && c === 0
+          ? 'Already in sync with saved data'
+          : `Synced from data: +${t} table${t === 1 ? '' : 's'}${c ? `, +cols on ${c} table${c === 1 ? '' : 's'}` : ''}`,
+      );
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setResyncing(false);
     }
   }
 
@@ -202,6 +230,17 @@ export function ProjectEditor() {
             ))}
           </nav>
 
+          {/* Resync schema from saved data db */}
+          <button
+            onClick={handleResync}
+            disabled={resyncing || saving}
+            title="Sync schema from saved data (adds tables/columns present in the data db but missing here)"
+            className="flex items-center gap-1.5 text-xs font-label uppercase tracking-widest border border-outline-variant text-on-surface-variant hover:text-on-surface hover:bg-surface-container px-3 py-2 rounded-md disabled:opacity-50 transition-all shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${resyncing ? 'animate-spin' : ''}`} />
+            <span className="hidden lg:inline">Resync</span>
+          </button>
+
           {/* Save button */}
           <button
             onClick={handleSave}
@@ -234,6 +273,12 @@ export function ProjectEditor() {
       {saveError && (
         <div className="shrink-0 mx-4 mt-2 bg-error/10 border border-error/30 rounded-md px-3 py-2 text-xs text-error font-label">
           {saveError}
+        </div>
+      )}
+
+      {resyncMsg && (
+        <div className="shrink-0 mx-4 mt-2 bg-primary/10 border border-primary/30 rounded-md px-3 py-2 text-xs text-primary font-label">
+          {resyncMsg}
         </div>
       )}
 

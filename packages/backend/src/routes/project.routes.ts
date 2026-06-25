@@ -12,7 +12,7 @@ import { inferFkCandidates } from '../services/fk-inference.service.js';
 import { parseErJson } from '../services/er-parser.service.js';
 import { generateProject } from '../services/multi-generate.service.js';
 import { appendJsonlChunk, readJsonlRows, jobTempPath, getTempDir } from '../services/tempfile.service.js';
-import { buildSqliteDb, updateSqliteSchema } from '../services/sqlite-export.service.js';
+import { buildSqliteDb, updateSqliteSchema, reconcileTablesFromDb } from '../services/sqlite-export.service.js';
 import { buildZipFromDb } from '../services/zip-export.service.js';
 import { GenerationCancelledError } from '../types/index.js';
 import type { DatasetSchema, Project, TableRowConfig } from '../types/index.js';
@@ -546,6 +546,50 @@ export async function projectRoutes(app: FastifyInstance) {
       }
 
       reply.send({ ok: true, data: { hasSavedData: true, savedAt, tableNames } });
+    },
+  );
+
+  // ── Resync schema definition from saved data db ───────────────────────────
+  // Pulls the actual tables/columns present in project-data/<id>.db into the
+  // project metadata blob. Additive only — never drops design tables/columns.
+  // Use when design (synthetic.db) drifts behind the saved data db (e.g. after
+  // building tables via query/import, or a partial save dropped definitions).
+
+  app.post<{ Params: { id: string } }>(
+    '/projects/:id/resync-schema',
+    async (req, reply) => {
+      if (!SafeIdRe.test(req.params.id)) return reply.code(400).send({ ok: false, error: 'invalid id' });
+
+      const project = getProject(req.params.id, reply);
+      if (!project) return;
+
+      const dbPath = projectDbPath(req.params.id);
+      if (!fs.existsSync(dbPath)) {
+        return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
+      }
+
+      let reconciled;
+      try {
+        reconciled = reconcileTablesFromDb(project.tables, dbPath);
+      } catch (e) {
+        return reply.code(500).send({ ok: false, error: (e as Error).message });
+      }
+
+      const updated: Project = {
+        ...project,
+        tables: reconciled.tables,
+        updatedAt: new Date().toISOString(),
+      };
+      projectStore.set(updated);
+
+      return reply.send({
+        ok: true,
+        data: {
+          project: updated,
+          addedTables: reconciled.addedTables,
+          addedColumns: reconciled.addedColumns,
+        },
+      });
     },
   );
 
