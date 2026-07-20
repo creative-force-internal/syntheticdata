@@ -31,6 +31,7 @@ import { nanoid } from 'nanoid';
 import { db as mainDb, projectDbPath, ensureProjectDataDir } from '../db/database.js';
 import { projectStore } from '../store/session.store.js';
 import { buildSqliteDb } from '../services/sqlite-export.service.js';
+import { getProjectDb, closeProjectDb, checkpointProjectDb } from '../services/project-db.service.js';
 import type { GenerationJob, ProjectApiKey } from '../types/index.js';
 
 // ─── Security ─────────────────────────────────────────────────────────────────
@@ -91,6 +92,9 @@ async function resolveD1Db(projectId: string): Promise<string | null> {
     const project = projectStore.get(projectId);
     if (!project) return null;
     ensureProjectDataDir();
+    // A cached connection would pin the old file (Windows: unlink fails on
+    // open handles) and keep serving stale data after the rebuild.
+    closeProjectDb(projectId);
     build = buildSqliteDb(project.tables, job.resultPaths, dbPath)
       .finally(() => { d1Building.delete(projectId); });
     d1Building.set(projectId, build);
@@ -180,16 +184,46 @@ function execStatement(
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
+// Positive-lookup cache skips a main-DB read per request; last_used_at is
+// throttled to one write per key per minute — it was a hot-path fsync for
+// purely cosmetic data. Both maps are invalidated on key deletion below.
+const AUTH_CACHE_TTL_MS = 60_000;
+const LAST_USED_WRITE_INTERVAL_MS = 60_000;
+const authCache = new Map<string, { keyId: string; expires: number }>(); // `${projectId}:${hash}`
+const lastUsedWrittenAt = new Map<string, number>(); // keyId → epoch ms
+
 function authenticate(authHeader: string | undefined, projectId: string): boolean {
   if (!authHeader?.startsWith('Bearer ')) return false;
   const hash = hashKey(authHeader.slice(7));
-  const row = mainDb.prepare(`
-    SELECT id FROM project_api_keys WHERE key_hash = ? AND project_id = ?
-  `).get(hash, projectId) as { id: string } | undefined;
-  if (!row) return false;
-  mainDb.prepare(`UPDATE project_api_keys SET last_used_at = ? WHERE id = ?`)
-    .run(new Date().toISOString(), row.id);
+  const cacheKey = `${projectId}:${hash}`;
+  const now = Date.now();
+
+  let keyId: string;
+  const cached = authCache.get(cacheKey);
+  if (cached && cached.expires > now) {
+    keyId = cached.keyId;
+  } else {
+    const row = mainDb.prepare(`
+      SELECT id FROM project_api_keys WHERE key_hash = ? AND project_id = ?
+    `).get(hash, projectId) as { id: string } | undefined;
+    if (!row) return false;
+    keyId = row.id;
+    authCache.set(cacheKey, { keyId, expires: now + AUTH_CACHE_TTL_MS });
+  }
+
+  if (now - (lastUsedWrittenAt.get(keyId) ?? 0) >= LAST_USED_WRITE_INTERVAL_MS) {
+    lastUsedWrittenAt.set(keyId, now);
+    mainDb.prepare(`UPDATE project_api_keys SET last_used_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), keyId);
+  }
   return true;
+}
+
+function invalidateAuthCacheForKey(keyId: string): void {
+  for (const [k, v] of authCache) {
+    if (v.keyId === keyId) authCache.delete(k);
+  }
+  lastUsedWrittenAt.delete(keyId);
 }
 
 // ─── Route plugin ─────────────────────────────────────────────────────────────
@@ -221,7 +255,7 @@ export async function d1Routes(app: FastifyInstance) {
         const parsed = parseBatchBody(req.body);
         if ('error' in parsed) return reply.code(400).send(parsed);
 
-        const db = new BetterSqlite3(dbPath);
+        const db = getProjectDb(projectId, dbPath);
         try {
           let results: D1Success[] = [];
           // Wrapping in a transaction makes the batch atomic:
@@ -240,22 +274,16 @@ export async function d1Routes(app: FastifyInstance) {
           return reply.send(results);
         } catch (e) {
           return reply.code(400).send({ error: (e as Error).message });
-        } finally {
-          db.close();
         }
       } else {
         // ── Single ─────────────────────────────────────────────────────────
         const parsed = parseSingleBody(req.body);
         if ('error' in parsed) return reply.code(400).send(parsed);
 
-        const db = new BetterSqlite3(dbPath);
-        try {
-          const result = execQuery(db, parsed.sql, parsed.params);
-          if ('error' in result) return reply.code(400).send(result);
-          return reply.send(result);
-        } finally {
-          db.close();
-        }
+        const db = getProjectDb(projectId, dbPath);
+        const result = execQuery(db, parsed.sql, parsed.params);
+        if ('error' in result) return reply.code(400).send(result);
+        return reply.send(result);
       }
     },
   );
@@ -281,14 +309,10 @@ export async function d1Routes(app: FastifyInstance) {
         return reply.code(404).send({ error: 'No generated data. Run generate first.' });
       }
 
-      const db = new BetterSqlite3(dbPath);
-      try {
-        const result = execStatement(db, parsed.sql, parsed.params);
-        if ('error' in result) return reply.code(400).send(result);
-        return reply.send(result);
-      } finally {
-        db.close();
-      }
+      const db = getProjectDb(projectId, dbPath);
+      const result = execStatement(db, parsed.sql, parsed.params);
+      if ('error' in result) return reply.code(400).send(result);
+      return reply.send(result);
     },
   );
 
@@ -310,6 +334,10 @@ export async function d1Routes(app: FastifyInstance) {
       if (!dbPath) {
         return reply.code(404).send({ error: 'No generated data. Run generate first.' });
       }
+
+      // Cached connection may hold recent commits in the -wal sidecar;
+      // flush so the raw file stream is complete.
+      checkpointProjectDb(projectId);
 
       return reply
         .type('application/x-sqlite3')
@@ -399,6 +427,7 @@ export async function d1Routes(app: FastifyInstance) {
       if (result.changes === 0) {
         return reply.code(404).send({ ok: false, error: 'API key not found' });
       }
+      invalidateAuthCacheForKey(keyId);
       return reply.send({ ok: true });
     },
   );

@@ -80,6 +80,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_api_keys_hash    ON project_api_keys(key_hash);
 `);
 
+// Serves the D1 cold-path lookup (latest done job per project) without a full
+// table scan + per-row JSON parse. The json_extract expression must match the
+// query text exactly for SQLite to use this index.
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_jobs_done_project
+  ON jobs(status, json_extract(data, '$.projectId'), created_at);
+`);
+
 // Idempotent ALTER: add projects.group_id column on first run only.
 // SQLite has no "ADD COLUMN IF NOT EXISTS"; introspect via PRAGMA.
 {

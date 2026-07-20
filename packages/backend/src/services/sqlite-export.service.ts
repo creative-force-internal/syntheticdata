@@ -207,8 +207,11 @@ export async function buildSqliteDb(
   resultPaths: Record<string, string>, // tableId → JSONL path
   outPath: string,
 ): Promise<void> {
-  // Remove existing file so we start clean
-  if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+  // Remove existing file so we start clean (including WAL sidecars — a stale
+  // -wal from the old file must not be replayed into the new one)
+  for (const p of [outPath, `${outPath}-wal`, `${outPath}-shm`]) {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  }
 
   const db = new Database(outPath);
   db.pragma('journal_mode = WAL');
@@ -276,7 +279,25 @@ export async function buildSqliteDb(
         });
         rl.on('error', reject);
       });
+
+      // ── Index PK/FK/unique columns ────────────────────────────────────────
+      // Created after the bulk insert (faster than maintaining during load).
+      // Non-unique on purpose: synthetic data may contain duplicates and the
+      // goal is query speed, not constraint enforcement.
+      for (const col of table.columns) {
+        if (col.indexType === 'none' || !columns.includes(col.name)) continue;
+        const safeCol = col.name.replace(/"/g, '""');
+        const idxName = `idx_${tableName}_${col.name}`.replace(/[^a-zA-Z0-9_]/g, '_');
+        try {
+          db.exec(`CREATE INDEX IF NOT EXISTS "${idxName}" ON "${tableName}" ("${safeCol}")`);
+        } catch {
+          // Index failure must not fail the build
+        }
+      }
     }
+
+    // Planner statistics for the freshly built indexes
+    try { db.exec('ANALYZE'); } catch { /* best effort */ }
   } finally {
     db.close();
   }

@@ -13,6 +13,7 @@ import { parseErJson } from '../services/er-parser.service.js';
 import { generateProject } from '../services/multi-generate.service.js';
 import { appendJsonlChunk, readJsonlRows, jobTempPath, getTempDir } from '../services/tempfile.service.js';
 import { buildSqliteDb, updateSqliteSchema, reconcileTablesFromDb } from '../services/sqlite-export.service.js';
+import { closeProjectDb, checkpointProjectDb } from '../services/project-db.service.js';
 import { buildZipFromDb } from '../services/zip-export.service.js';
 import { GenerationCancelledError } from '../types/index.js';
 import type { DatasetSchema, Project, TableRowConfig } from '../types/index.js';
@@ -173,6 +174,9 @@ export async function projectRoutes(app: FastifyInstance) {
     const dbPath = projectDbPath(req.params.id);
     if (fs.existsSync(dbPath)) {
       try {
+        // Evict any cached D1 connection so schema changes are not served
+        // through stale prepared statements.
+        closeProjectDb(req.params.id);
         updateSqliteSchema(updated.tables, dbPath);
       } catch (e) {
         app.log.warn({ err: e, projectId: req.params.id }, 'Failed to update project DB schema');
@@ -516,6 +520,9 @@ export async function projectRoutes(app: FastifyInstance) {
       ensureProjectDataDir();
       const dbPath = projectDbPath(req.params.id);
 
+      // A cached D1 connection would pin the old file (Windows: unlink fails
+      // on open handles) and keep serving stale data after the rebuild.
+      closeProjectDb(req.params.id);
       await buildSqliteDb(project.tables, job.resultPaths, dbPath);
 
       reply.send({ ok: true, data: { savedAt: new Date().toISOString() } });
@@ -643,6 +650,9 @@ export async function projectRoutes(app: FastifyInstance) {
       if (!fs.existsSync(dbPath)) {
         return reply.code(404).send({ ok: false, error: 'No saved data. Generate and save data first.' });
       }
+
+      // Flush WAL from any cached D1 connection so the raw file is complete.
+      checkpointProjectDb(req.params.id);
 
       const safeName = project.name.replace(/[^a-zA-Z0-9_-]/g, '_');
       reply
