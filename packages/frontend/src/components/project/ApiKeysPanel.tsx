@@ -69,7 +69,7 @@ export function ApiKeysPanel() {
     setTimeout(() => setCopied(false), 2000);
   }
 
-  const baseUrl = `${window.location.protocol}//${window.location.hostname}:3001`;
+  const baseUrl = `${window.location.protocol}//${window.location.hostname}`;
 
   return (
     <div className="flex flex-col items-center p-8 max-w-2xl mx-auto w-full">
