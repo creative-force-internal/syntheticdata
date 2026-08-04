@@ -41,6 +41,14 @@ const BLOCKED_SQL_RE = /\b(attach|detach)\b/i;
 
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// Leading keyword marks a statement that writes or defines schema. Used to
+// decide whether an absent project DB should be provisioned instead of 404'd.
+const WRITE_SQL_RE = /^\s*(?:create|alter|drop|insert|update|delete|replace|pragma|with\b[\s\S]*?\b(?:insert|update|delete)\b)/i;
+
+function hasWrite(stmts: ParsedStmt[]): boolean {
+  return stmts.some(s => WRITE_SQL_RE.test(s.sql));
+}
+
 // ─── API key helpers ──────────────────────────────────────────────────────────
 
 function hashKey(key: string): string {
@@ -60,6 +68,22 @@ function generateApiKey(): { key: string; prefix: string; hash: string } {
 const d1Building = new Map<string, Promise<void>>();
 
 /**
+ * Provision an empty WAL-mode SQLite file for a project that has no generated
+ * data yet, so schema-creating writes (migrations) have somewhere to land.
+ * Returns null if the project itself does not exist.
+ */
+function createEmptyProjectDb(projectId: string): string | null {
+  if (!projectStore.get(projectId)) return null;
+  ensureProjectDataDir();
+  const dbPath = projectDbPath(projectId);
+  // Opening creates the file; the pragma persists WAL mode in the header so
+  // the cached connection and the UI agree on journal mode.
+  const seed = new BetterSqlite3(dbPath);
+  try { seed.pragma('journal_mode = WAL'); } finally { seed.close(); }
+  return dbPath;
+}
+
+/**
  * Resolve the project's persistent SQLite data file — the same DB the UI reads
  * and writes (save-data / query-saved / export). This is the single source of
  * truth, so D1 writes via /execute persist and are visible in the UI.
@@ -68,8 +92,16 @@ const d1Building = new Map<string, Promise<void>>();
  * As a fallback, when no saved DB exists yet, build one from the latest
  * completed job so the API works immediately after generation without an
  * explicit UI save.
+ *
+ * `createIfMissing` provisions an empty DB when neither a saved file nor a
+ * completed job exists. Write paths need this: a migration runner sends DDL
+ * before any data exists, and 404-ing there is a chicken-and-egg deadlock
+ * (can't create tables because no tables were created yet).
  */
-async function resolveD1Db(projectId: string): Promise<string | null> {
+async function resolveD1Db(
+  projectId: string,
+  opts: { createIfMissing?: boolean } = {},
+): Promise<string | null> {
   const dbPath = projectDbPath(projectId);
   if (fs.existsSync(dbPath)) return dbPath;
 
@@ -82,10 +114,12 @@ async function resolveD1Db(projectId: string): Promise<string | null> {
     LIMIT 1
   `).get(projectId) as JobRow | undefined;
 
-  if (!row) return null;
+  const job = row ? (JSON.parse(row.data) as GenerationJob) : undefined;
 
-  const job = JSON.parse(row.data) as GenerationJob;
-  if (!job.resultPaths) return null;
+  if (!job?.resultPaths) {
+    if (!opts.createIfMissing) return null;
+    return createEmptyProjectDb(projectId);
+  }
 
   let build = d1Building.get(projectId);
   if (!build) {
@@ -145,6 +179,10 @@ function parseBatchBody(body: unknown): ParsedStmt[] | D1Error {
 
 // ─── SQL execution ────────────────────────────────────────────────────────────
 
+// .all() rejects statements that return no rows (DDL, INSERT/UPDATE/DELETE)
+// with this exact message. D1's /query runs them fine, so retry with .run().
+const NO_DATA_MSG = 'This statement does not return data. Use run() instead';
+
 function execQuery<T>(
   db: BetterSqlite3.Database,
   sql: string,
@@ -156,9 +194,18 @@ function execQuery<T>(
     const rows = db.prepare(sql).all(...params) as T[];
     return { results: rows, lastRowId: null, changes: 0, duration: Date.now() - t0 };
   } catch (e) {
+    if ((e as Error).message === NO_DATA_MSG) {
+      const info = execStatement(db, sql, params);
+      return 'error' in info ? info : { ...info, results: [] as T[] };
+    }
     return { error: (e as Error).message };
   }
 }
+
+// better-sqlite3's prepare() rejects semicolon-separated SQL with this exact
+// RangeError. Semicolon counting can't detect it (they appear inside string
+// literals), so the thrown error is the detector.
+const MULTI_STMT_MSG = 'The supplied SQL string contains more than one statement';
 
 function execStatement(
   db: BetterSqlite3.Database,
@@ -178,6 +225,17 @@ function execStatement(
       duration: Date.now() - t0,
     };
   } catch (e) {
+    // D1's /execute accepts semicolon-separated SQL — migration files arrive as
+    // one multi-statement string. exec() runs those; it binds no params, so this
+    // path is only valid when none were supplied.
+    if ((e as Error).message === MULTI_STMT_MSG && params.length === 0) {
+      try {
+        db.exec(sql);
+        return { results: [], lastRowId: null, changes: 0, duration: Date.now() - t0 };
+      } catch (e2) {
+        return { error: (e2 as Error).message };
+      }
+    }
     return { error: (e as Error).message };
   }
 }
@@ -245,29 +303,30 @@ export async function d1Routes(app: FastifyInstance) {
         return reply.code(401).send({ error: 'Unauthorized' });
       }
 
-      const dbPath = await resolveD1Db(projectId);
+      // Parse before resolving the DB: migration runners send DDL through
+      // /query, so a write-bearing body must provision an empty DB rather than
+      // 404. Pure reads keep the "run generate first" hint.
+      const body = Array.isArray(req.body) ? parseBatchBody(req.body) : parseSingleBody(req.body);
+      if ('error' in body) return reply.code(400).send(body);
+      const stmts = Array.isArray(body) ? body : [body];
+
+      const dbPath = await resolveD1Db(projectId, { createIfMissing: hasWrite(stmts) });
       if (!dbPath) {
         return reply.code(404).send({ error: 'No generated data. Run generate first.' });
       }
 
-      if (Array.isArray(req.body)) {
+      if (Array.isArray(body)) {
         // ── Batch (atomic) ─────────────────────────────────────────────────
-        const parsed = parseBatchBody(req.body);
-        if ('error' in parsed) return reply.code(400).send(parsed);
-
         const db = getProjectDb(projectId, dbPath);
         try {
           let results: D1Success[] = [];
           // Wrapping in a transaction makes the batch atomic:
           // if any statement throws, all preceding changes roll back.
           const runBatch = db.transaction(() => {
-            results = parsed.map(s => {
-              if (BLOCKED_SQL_RE.test(s.sql)) {
-                throw new Error('ATTACH and DETACH are not permitted');
-              }
-              const t0 = Date.now();
-              const rows = db.prepare(s.sql).all(...s.params) as Record<string, unknown>[];
-              return { results: rows, lastRowId: null, changes: 0, duration: Date.now() - t0 };
+            results = body.map(s => {
+              const r = execQuery<Record<string, unknown>>(db, s.sql, s.params);
+              if ('error' in r) throw new Error(r.error);
+              return r;
             });
           });
           runBatch();
@@ -277,11 +336,8 @@ export async function d1Routes(app: FastifyInstance) {
         }
       } else {
         // ── Single ─────────────────────────────────────────────────────────
-        const parsed = parseSingleBody(req.body);
-        if ('error' in parsed) return reply.code(400).send(parsed);
-
         const db = getProjectDb(projectId, dbPath);
-        const result = execQuery(db, parsed.sql, parsed.params);
+        const result = execQuery(db, body.sql, body.params);
         if ('error' in result) return reply.code(400).send(result);
         return reply.send(result);
       }
@@ -304,9 +360,11 @@ export async function d1Routes(app: FastifyInstance) {
       const parsed = parseSingleBody(req.body);
       if ('error' in parsed) return reply.code(400).send(parsed);
 
-      const dbPath = await resolveD1Db(projectId);
+      // Writes may be schema-creating (migrations), so provision an empty DB
+      // rather than 404 when the project has no generated data yet.
+      const dbPath = await resolveD1Db(projectId, { createIfMissing: true });
       if (!dbPath) {
-        return reply.code(404).send({ error: 'No generated data. Run generate first.' });
+        return reply.code(404).send({ error: 'Project not found' });
       }
 
       const db = getProjectDb(projectId, dbPath);
