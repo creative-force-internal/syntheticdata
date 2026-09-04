@@ -382,6 +382,7 @@ synthetic/
 └── package.json          # Root workspace config
 ```
 
+
 ## License
 
 Internal / unlicensed. Contact the author for usage terms.
