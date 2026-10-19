@@ -3,6 +3,8 @@ name: Zero-Ops Deploy to ECS
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 0 * * 0' # weekly, Sunday 00:00 UTC
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -267,7 +269,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           JOB_STATUS: ${{ job.status }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || 'Scheduled weekly redeploy' }}
           GIT_ACTOR: ${{ github.actor }}
           GIT_REPO: ${{ github.repository }}
           GIT_SHA: ${{ github.sha }}
