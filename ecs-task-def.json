@@ -5,7 +5,7 @@
     "FARGATE"
   ],
   "cpu": "1024",
-  "memory": "1024",
+  "memory": "2048",
   "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
   "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskRole",
   "volumes": [
